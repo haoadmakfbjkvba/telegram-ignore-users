@@ -1,0 +1,3151 @@
+diff --git a/Telegram/Telegram-iOS/en.lproj/Localizable.strings b/Telegram/Telegram-iOS/en.lproj/Localizable.strings
+index 242e45b324..053b5a5298 100644
+--- a/Telegram/Telegram-iOS/en.lproj/Localizable.strings
++++ b/Telegram/Telegram-iOS/en.lproj/Localizable.strings
+@@ -17243,3 +17243,18 @@ Error: %8$@";
+ "Gift.Delete.Title" = "Delete Gift";
+ "Gift.Delete.Text" = "Do you want to delete this gift?\n\nIt will disappear from your profile and can't be restored.";
+ "Gift.Delete.Success" = "Gift Deleted";
++
++"IgnoredMembers.Ignore" = "Ignore %@";
++"IgnoredMembers.StopIgnoring" = "Stop Ignoring %@";
++"IgnoredMembers.StopIgnoringShort" = "Stop Ignoring";
++"IgnoredMembers.PanelTitle" = "%@ is ignored";
++"IgnoredMembers.PanelTitleMany" = "%@ people are ignored";
++"IgnoredMembers.PanelText" = "Hidden for you · Tap to show them";
++"IgnoredMembers.ToastIgnoredTitle" = "%@ is ignored";
++"IgnoredMembers.ToastIgnoredText" = "Their messages are hidden for you in all groups. They won't know.";
++"IgnoredMembers.ListTitle" = "Ignored in Groups";
++"IgnoredMembers.ListInfo" = "Messages from these people are hidden for you in all groups and in channel comments. They are not told.";
++"IgnoredMembers.ListEmpty" = "To ignore someone, hold one of their messages in a group and choose Ignore.";
++"IgnoredMembers.ProfileIgnore" = "Ignore in Groups";
++"IgnoredMembers.HiddenReply" = "Message from someone you ignore";
++"IgnoredMembers.HiddenMessage" = "Hidden message";
+diff --git a/submodules/ChatListUI/BUILD b/submodules/ChatListUI/BUILD
+index af464d4085..cdef669698 100644
+--- a/submodules/ChatListUI/BUILD
++++ b/submodules/ChatListUI/BUILD
+@@ -12,6 +12,7 @@ swift_library(
+         "-warnings-as-errors",
+     ],
+     deps = [
++        "//submodules/TelegramUI/Components/IgnoredMembers",
+         "//submodules/SSignalKit/SwiftSignalKit:SwiftSignalKit",
+         "//submodules/LottieSettings:LottieSettings",
+         "//submodules/AsyncDisplayKit:AsyncDisplayKit",
+diff --git a/submodules/ChatListUI/Sources/Node/ChatListItem.swift b/submodules/ChatListUI/Sources/Node/ChatListItem.swift
+index e41738b1ec..39aaed55b8 100644
+--- a/submodules/ChatListUI/Sources/Node/ChatListItem.swift
++++ b/submodules/ChatListUI/Sources/Node/ChatListItem.swift
+@@ -29,6 +29,7 @@ import MultilineTextComponent
+ import MultilineTextWithEntitiesComponent
+ import ShimmerEffect
+ import GlassBackgroundComponent
++import IgnoredMembers
+ 
+ public enum ChatListItemContent {
+     public final class ThreadInfo: Equatable {
+@@ -3021,6 +3022,13 @@ public class ChatListItemNode: ItemListRevealOptionsItemNode {
+                             attributedText = mutableAttributedText
+                         }
+                         
++                        // The last message is of someone ignored in groups: what it says stays hidden.
++                        let hidesIgnoredMessage = IgnoredMembers.hides(message: message._asMessage(), ignored: Set(IgnoredMembers.shared.list(accountPeerId: item.context.account.peerId)))
++                        if hidesIgnoredMessage {
++                            attributedText = NSAttributedString(string: item.presentationData.strings.IgnoredMembers_HiddenMessage, font: textFont, textColor: theme.messageTextColor)
++                            ignoreForwardedIcon = true
++                        }
++                        
+                         if !ignoreForwardedIcon {
+                             if case .savedMessagesChats = item.chatListLocation {
+                             } else if let forwardInfo = message.forwardInfo, !forwardInfo.flags.contains(.isImported) && !message.id.peerId.isVerificationCodes {
+@@ -3062,7 +3070,7 @@ public class ChatListItemNode: ItemListRevealOptionsItemNode {
+                             }
+                         }
+                 
+-                        var displayMediaPreviews = true
++                        var displayMediaPreviews = !hidesIgnoredMessage
+                         if message._asMessage().containsSecretMedia {
+                             displayMediaPreviews = false
+                         } else if let _ = message.peers[message.id.peerId] as? TelegramSecretChat {
+diff --git a/submodules/ChatListUI/Sources/Node/ChatListNode.swift b/submodules/ChatListUI/Sources/Node/ChatListNode.swift
+index 05e8610787..ba503756ea 100644
+--- a/submodules/ChatListUI/Sources/Node/ChatListNode.swift
++++ b/submodules/ChatListUI/Sources/Node/ChatListNode.swift
+@@ -24,6 +24,7 @@ import UndoUI
+ import NewSessionInfoScreen
+ import PresentationDataUtils
+ import GlobalControlPanelsContext
++import IgnoredMembers
+ 
+ public enum ChatListNodeMode {
+     case chatList(appendContacts: Bool)
+@@ -2185,6 +2186,7 @@ public final class ChatListNode: ListViewImpl {
+         let previousChatListFilters = Atomic<[ChatListFilter]?>(value: nil)
+         
+         let previousAccountIsPremium = Atomic<Bool?>(value: nil)
++        let previousIgnoredMembers = Atomic<Set<EnginePeer.Id>>(value: Set())
+         
+         let accountIsPremium = context.engine.data.subscribe(
+             TelegramEngine.EngineData.Item.Peer.Peer(id: context.account.peerId)
+@@ -2203,10 +2205,12 @@ public final class ChatListNode: ListViewImpl {
+             self.statePromise.get(),
+             contacts,
+             chatListFilters,
+-            accountIsPremium
++            combineLatest(accountIsPremium, IgnoredMembers.shared.signal(accountPeerId: context.account.peerId))
+         )
+-        |> mapToQueue { (hideArchivedFolderByDefault, displayArchiveIntro, storageInfo, savedMessagesPeer, updateAndFilter, state, contacts, chatListFilters, accountIsPremium) -> Signal<ChatListNodeListViewTransition, NoError> in
++        |> mapToQueue { (hideArchivedFolderByDefault, displayArchiveIntro, storageInfo, savedMessagesPeer, updateAndFilter, state, contacts, chatListFilters, accountIsPremiumAndIgnored) -> Signal<ChatListNodeListViewTransition, NoError> in
+             let (update, filter) = updateAndFilter
++            // The people ignored in groups: the last messages of theirs show as hidden.
++            let (accountIsPremium, ignoredMembers) = accountIsPremiumAndIgnored
+             
+             let previousHideArchivedFolderByDefaultValue = previousHideArchivedFolderByDefault.swap(hideArchivedFolderByDefault)
+             
+@@ -2676,6 +2680,9 @@ public final class ChatListNode: ListViewImpl {
+             if accountIsPremium != previousAccountIsPremium.swap(accountIsPremium) {
+                 forceAllUpdated = true
+             }
++            if ignoredMembers != previousIgnoredMembers.swap(ignoredMembers) {
++                forceAllUpdated = true
++            }
+             let presentationData = state.presentationData
+             
+             return preparedChatListNodeViewTransition(from: previousView, to: processedView, reason: reason, previewing: previewing, disableAnimations: disableAnimations, scrollPosition: updatedScrollPosition, searchMode: searchMode, forceAllUpdated: forceAllUpdated)
+diff --git a/submodules/SettingsUI/BUILD b/submodules/SettingsUI/BUILD
+index 2b819a9ca9..9006fb9ef4 100644
+--- a/submodules/SettingsUI/BUILD
++++ b/submodules/SettingsUI/BUILD
+@@ -12,6 +12,7 @@ swift_library(
+         "-warnings-as-errors",
+     ],
+     deps = [
++        "//submodules/TelegramUI/Components/IgnoredMembers",
+         "//submodules/SSignalKit/SwiftSignalKit:SwiftSignalKit",
+         "//submodules/LottieSettings:LottieSettings",
+         "//submodules/AsyncDisplayKit:AsyncDisplayKit",
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index 8c4740342a..28cf66579f 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -7,6 +7,7 @@ import TelegramPresentationData
+ import TelegramUIPreferences
+ import TelegramCallsUI
+ import ItemListUI
++import IgnoredMembers
+ import PresentationDataUtils
+ import AccountContext
+ import TelegramNotices
+@@ -25,6 +26,8 @@ import ContextUI
+ private final class PrivacyAndSecurityControllerArguments {
+     let account: Account
+     let openBlockedUsers: () -> Void
++    /// Opens the people ignored in groups.
++    var openIgnoredMembers: (() -> Void)?
+     let openLastSeenPrivacy: () -> Void
+     let openGroupsPrivacy: () -> Void
+     let openVoiceCallPrivacy: () -> Void
+@@ -104,6 +107,7 @@ public enum PrivacyAndSecurityEntryTag: ItemListItemTag {
+ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+     case privacyHeader(PresentationTheme, String)
+     case blockedPeers(PresentationTheme, String, String)
++    case ignoredMembers(String, String)
+     case phoneNumberPrivacy(PresentationTheme, String, String)
+     case lastSeenPrivacy(PresentationTheme, String, String)
+     case profilePhotoPrivacy(PresentationTheme, String, String)
+@@ -138,7 +142,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+     
+     var section: ItemListSectionId {
+         switch self {
+-        case .blockedPeers, .activeSessions, .passcode, .twoStepVerification, .passkeys, .messageAutoremoveTimeout, .messageAutoremoveInfo:
++        case .blockedPeers, .ignoredMembers, .activeSessions, .passcode, .twoStepVerification, .passkeys, .messageAutoremoveTimeout, .messageAutoremoveInfo:
+             return PrivacyAndSecuritySection.general.rawValue
+         case .loginEmail, .loginEmailInfo:
+             return PrivacyAndSecuritySection.loginEmail.rawValue
+@@ -157,6 +161,8 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+     
+     var stableId: Int32 {
+         switch self {
++            case .ignoredMembers:
++                return 1000
+             case .blockedPeers:
+                 return 1
+             case .activeSessions:
+@@ -234,6 +240,12 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+                 } else {
+                     return false
+                 }
++            case let .ignoredMembers(lhsText, lhsValue):
++                if case let .ignoredMembers(rhsText, rhsValue) = rhs, lhsText == rhsText, lhsValue == rhsValue {
++                    return true
++                } else {
++                    return false
++                }
+             case let .blockedPeers(lhsTheme, lhsText, lhsValue):
+                 if case let .blockedPeers(rhsTheme, rhsText, rhsValue) = rhs, lhsTheme === rhsTheme, lhsText == rhsText, lhsValue == rhsValue {
+                     return true
+@@ -429,8 +441,16 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+         }
+     }
+     
++    /// The order of the entries: as their ids, with "Ignored in Groups" right after "Blocked Users".
++    private var sortKey: Int32 {
++        if case .ignoredMembers = self {
++            return 3
++        }
++        return self.stableId * 2
++    }
++    
+     static func <(lhs: PrivacyAndSecurityEntry, rhs: PrivacyAndSecurityEntry) -> Bool {
+-        return lhs.stableId < rhs.stableId
++        return lhs.sortKey < rhs.sortKey
+     }
+     
+     func item(presentationData: ItemListPresentationData, arguments: Any) -> ListViewItem {
+@@ -442,6 +462,10 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+                 return ItemListDisclosureItem(presentationData: presentationData, systemStyle: .glass, icon: PresentationResourcesSettings.block, title: text, label: value, sectionId: self.section, style: .blocks, action: {
+                     arguments.openBlockedUsers()
+                 })
++            case let .ignoredMembers(text, value):
++                return ItemListDisclosureItem(presentationData: presentationData, systemStyle: .glass, icon: ignoredMembersSettingsIcon, title: text, label: value, sectionId: self.section, style: .blocks, action: {
++                    arguments.openIgnoredMembers?()
++                })
+             case let .phoneNumberPrivacy(_, text, value):
+                 return ItemListDisclosureItem(presentationData: presentationData, systemStyle: .glass, title: text, label: value, sectionId: self.section, style: .blocks, action: {
+                     arguments.openPhoneNumberPrivacy()
+@@ -658,6 +682,7 @@ private func privacyAndSecurityControllerEntries(
+     isPremiumDisabled: Bool,
+     isPremium: Bool,
+     loginEmail: String?,
++    ignoredMembersCount: Int,
+     accountPeer: EnginePeer?,
+     defaultWebBrowser: String,
+     appConfiguration: AppConfiguration
+@@ -665,6 +690,7 @@ private func privacyAndSecurityControllerEntries(
+     var entries: [PrivacyAndSecurityEntry] = []
+     
+     entries.append(.blockedPeers(presentationData.theme, presentationData.strings.Settings_BlockedUsers, blockedPeerCount == nil ? "" : (blockedPeerCount == 0 ? presentationData.strings.PrivacySettings_BlockedPeersEmpty : "\(blockedPeerCount!)")))
++    entries.append(.ignoredMembers(presentationData.strings.IgnoredMembers_ListTitle, ignoredMembersCount == 0 ? presentationData.strings.PrivacySettings_BlockedPeersEmpty : "\(ignoredMembersCount)"))
+     if activeWebsitesCount != 0 {
+         entries.append(.activeSessions(presentationData.theme, presentationData.strings.PrivacySettings_WebSessions, activeWebsitesCount == 0 ? "" : "\(activeWebsitesCount)"))
+     }
+@@ -1558,6 +1584,9 @@ public func privacyAndSecurityController(
+             }
+         }))
+     })
++    arguments.openIgnoredMembers = {
++        pushControllerImpl?(ignoredMembersController(context: context), true)
++    }
+     
+     actionsDisposable.add(context.engine.peers.managedUpdatedRecentPeers().start())
+ 
+@@ -1600,9 +1629,10 @@ public func privacyAndSecurityController(
+         combineLatest(passkeys.get(), passkeysDataValue.get()),
+         context.engine.data.subscribe(TelegramEngine.EngineData.Item.Configuration.App()),
+         context.engine.data.subscribe(TelegramEngine.EngineData.Item.Peer.Peer(id: context.account.peerId)),
+-        loginEmail
++        combineLatest(loginEmail, IgnoredMembers.shared.signal(accountPeerId: context.account.peerId))
+     )
+-    |> map { presentationData, state, privacySettings, noticeView, webBrowserData, recentPeers, blockedPeersState, activeWebsitesState, accessChallengeData, twoStepAuth, passkeys, appConfiguration, accountPeer, loginEmail -> (ItemListControllerState, (ItemListNodeState, Any)) in
++    |> map { presentationData, state, privacySettings, noticeView, webBrowserData, recentPeers, blockedPeersState, activeWebsitesState, accessChallengeData, twoStepAuth, passkeys, appConfiguration, accountPeer, loginEmailAndIgnored -> (ItemListControllerState, (ItemListNodeState, Any)) in
++        let (loginEmail, ignoredMembers) = loginEmailAndIgnored
+         var canAutoarchive = false
+         if let data = appConfiguration.data, let hasAutoarchive = data["autoarchive_setting_available"] as? Bool {
+             canAutoarchive = hasAutoarchive
+@@ -1636,7 +1666,7 @@ public func privacyAndSecurityController(
+             defaultWebBrowser = presentationData.strings.WebBrowser_Telegram
+         }
+         
+-        let listState = ItemListNodeState(presentationData: ItemListPresentationData(presentationData), entries: privacyAndSecurityControllerEntries(presentationData: presentationData, state: state, privacySettings: privacySettings, accessChallengeData: accessChallengeData.data, blockedPeerCount: blockedPeersState.totalCount, activeWebsitesCount: activeWebsitesState.sessions.count, hasTwoStepAuth: twoStepAuth.0, twoStepAuthData: twoStepAuth.1, hasPasskeys: passkeys.0, displayPasskeys: displayPasskeys, canAutoarchive: canAutoarchive, isPremiumDisabled: isPremiumDisabled, isPremium: isPremium, loginEmail: loginEmail, accountPeer: accountPeer, defaultWebBrowser: defaultWebBrowser, appConfiguration: appConfiguration), style: .blocks, ensureVisibleItemTag: focusOnItemTag, animateChanges: false)
++        let listState = ItemListNodeState(presentationData: ItemListPresentationData(presentationData), entries: privacyAndSecurityControllerEntries(presentationData: presentationData, state: state, privacySettings: privacySettings, accessChallengeData: accessChallengeData.data, blockedPeerCount: blockedPeersState.totalCount, activeWebsitesCount: activeWebsitesState.sessions.count, hasTwoStepAuth: twoStepAuth.0, twoStepAuthData: twoStepAuth.1, hasPasskeys: passkeys.0, displayPasskeys: displayPasskeys, canAutoarchive: canAutoarchive, isPremiumDisabled: isPremiumDisabled, isPremium: isPremium, loginEmail: loginEmail, ignoredMembersCount: ignoredMembers.count, accountPeer: accountPeer, defaultWebBrowser: defaultWebBrowser, appConfiguration: appConfiguration), style: .blocks, ensureVisibleItemTag: focusOnItemTag, animateChanges: false)
+         
+         return (controllerState, (listState, arguments))
+     }
+@@ -1734,3 +1764,40 @@ public func privacyAndSecurityController(
+     
+     return controller
+ }
++
++/// The icon of "Ignored in Groups": a crossed out eye on indigo.
++private let ignoredMembersSettingsIcon: UIImage? = generateImage(CGSize(width: 30.0, height: 30.0), rotatedContext: { size, context in
++    let bounds = CGRect(origin: CGPoint(), size: size)
++    context.clear(bounds)
++    context.addPath(UIBezierPath(roundedRect: bounds, cornerRadius: 7.0).cgPath)
++    context.setFillColor(UIColor(rgb: 0x5E5CE6).cgColor)
++    context.fillPath()
++    let eye = UIBezierPath()
++    eye.move(to: CGPoint(x: 6.0, y: 15.0))
++    eye.addQuadCurve(to: CGPoint(x: 24.0, y: 15.0), controlPoint: CGPoint(x: 15.0, y: 5.8))
++    eye.addQuadCurve(to: CGPoint(x: 6.0, y: 15.0), controlPoint: CGPoint(x: 15.0, y: 24.2))
++    eye.close()
++    context.setStrokeColor(UIColor.white.cgColor)
++    context.setLineWidth(1.8)
++    context.setLineCap(.round)
++    context.setLineJoin(.round)
++    context.addPath(eye.cgPath)
++    context.strokePath()
++    context.addEllipse(in: CGRect(x: 12.2, y: 12.2, width: 5.6, height: 5.6))
++    context.setFillColor(UIColor.white.cgColor)
++    context.fillPath()
++    // The slash, with a gap cut on either side of it.
++    context.setBlendMode(.clear)
++    context.setLineWidth(5.0)
++    context.move(to: CGPoint(x: 8.0, y: 7.5))
++    context.addLine(to: CGPoint(x: 22.0, y: 22.5))
++    context.strokePath()
++    context.setBlendMode(.normal)
++    context.setFillColor(UIColor(rgb: 0x5E5CE6).cgColor)
++    context.setStrokeColor(UIColor.white.cgColor)
++    context.setLineWidth(1.8)
++    context.move(to: CGPoint(x: 8.0, y: 7.5))
++    context.addLine(to: CGPoint(x: 22.0, y: 22.5))
++    context.strokePath()
++})
++
+diff --git a/submodules/TelegramUI/BUILD b/submodules/TelegramUI/BUILD
+index 75245702cc..31efeffafb 100644
+--- a/submodules/TelegramUI/BUILD
++++ b/submodules/TelegramUI/BUILD
+@@ -131,6 +131,7 @@ swift_library(
+         "//submodules/TelegramAnimatedStickerNode:TelegramAnimatedStickerNode",
+         "//submodules/ActionSheetPeerItem:ActionSheetPeerItem",
+         "//submodules/TelegramUI/Components/ComposePollScreen",
++        "//submodules/TelegramUI/Components/IgnoredMembers",
+         "//submodules/AlertUI:AlertUI",
+         "//submodules/PresentationDataUtils:PresentationDataUtils",
+         "//submodules/TelegramUI/Components/OpenUserGeneratedUrl:OpenUserGeneratedUrl",
+diff --git a/submodules/TelegramUI/Components/Chat/ChatMessageItemImpl/Sources/ChatMessageDateHeader.swift b/submodules/TelegramUI/Components/Chat/ChatMessageItemImpl/Sources/ChatMessageDateHeader.swift
+index 1fd892e6c8..b14164e758 100644
+--- a/submodules/TelegramUI/Components/Chat/ChatMessageItemImpl/Sources/ChatMessageDateHeader.swift
++++ b/submodules/TelegramUI/Components/Chat/ChatMessageItemImpl/Sources/ChatMessageDateHeader.swift
+@@ -967,6 +967,10 @@ public final class ChatMessageAvatarHeaderNodeImpl: ListViewItemHeaderNode, Chat
+     private var storyStats: EnginePeerStoryStats?
+     
+     private let peerId: EnginePeer.Id
++    /// Whose avatar this is.
++    public var avatarPeerId: EnginePeer.Id {
++        return self.peerId
++    }
+     private let messageReference: MessageReference?
+     private var peer: EnginePeer?
+     private let adMessageId: EngineMessage.Id?
+diff --git a/submodules/TelegramUI/Components/Chat/ChatMessageReplyInfoNode/BUILD b/submodules/TelegramUI/Components/Chat/ChatMessageReplyInfoNode/BUILD
+index 7acafa371c..8d9d9b0a66 100644
+--- a/submodules/TelegramUI/Components/Chat/ChatMessageReplyInfoNode/BUILD
++++ b/submodules/TelegramUI/Components/Chat/ChatMessageReplyInfoNode/BUILD
+@@ -10,6 +10,7 @@ swift_library(
+         "-warnings-as-errors",
+     ],
+     deps = [
++        "//submodules/TelegramUI/Components/IgnoredMembers",
+         "//submodules/AsyncDisplayKit",
+         "//submodules/Display",
+         "//submodules/TelegramCore",
+diff --git a/submodules/TelegramUI/Components/Chat/ChatMessageReplyInfoNode/Sources/ChatMessageReplyInfoNode.swift b/submodules/TelegramUI/Components/Chat/ChatMessageReplyInfoNode/Sources/ChatMessageReplyInfoNode.swift
+index 3c61f5e9d6..583404bb3a 100644
+--- a/submodules/TelegramUI/Components/Chat/ChatMessageReplyInfoNode/Sources/ChatMessageReplyInfoNode.swift
++++ b/submodules/TelegramUI/Components/Chat/ChatMessageReplyInfoNode/Sources/ChatMessageReplyInfoNode.swift
+@@ -18,6 +18,7 @@ import ChatMessageItemCommon
+ import MessageInlineBlockBackgroundView
+ import CheckNode
+ import EmojiTextAttachmentView
++import IgnoredMembers
+ 
+ public enum ChatMessageReplyInfoType {
+     case bubble(incoming: Bool)
+@@ -525,13 +526,23 @@ public class ChatMessageReplyInfoNode: ASDisplayNode {
+                 }
+             }
+             
++            // A reply to someone ignored in groups: what their message says and shows stays hidden.
++            var hidesIgnored = false
++            if let message = arguments.message, IgnoredMembers.hides(message: message, ignored: Set(IgnoredMembers.shared.list(accountPeerId: arguments.context.account.peerId))) {
++                hidesIgnored = true
++                messageText = NSAttributedString(string: arguments.strings.IgnoredMembers_HiddenReply, font: Font.italic(textFont.pointSize), textColor: textColor.withMultipliedAlpha(0.7))
++                // Nor whether a to-do item it answers is done.
++                todoItemCompleted = nil
++                textLeftInset = 0.0
++            }
++            
+             var leftInset: CGFloat = 11.0
+             let spacing: CGFloat = 2.0
+             
+             var updatedMediaReference: AnyMediaReference?
+             var imageDimensions: CGSize?
+             var hasRoundImage = false
+-            if case let .pollOption(optionId) = arguments.innerSubject, let poll = arguments.message?.media.first(where: { $0 is TelegramMediaPoll }) as? TelegramMediaPoll, let pollOption = poll.options.first(where: { $0.opaqueIdentifier == optionId }), let media = pollOption.media {
++            if !hidesIgnored, case let .pollOption(optionId) = arguments.innerSubject, let poll = arguments.message?.media.first(where: { $0 is TelegramMediaPoll }) as? TelegramMediaPoll, let pollOption = poll.options.first(where: { $0.opaqueIdentifier == optionId }), let media = pollOption.media {
+                 if let image = media as? TelegramMediaImage {
+                     updatedMediaReference = .message(message: MessageReference(arguments.parentMessage), media: image)
+                     if let representation = largestRepresentationForPhoto(image) {
+@@ -549,7 +560,7 @@ public class ChatMessageReplyInfoNode: ASDisplayNode {
+                         hasRoundImage = true
+                     }
+                 }
+-            } else if let message = arguments.message, !message.containsSecretMedia {
++            } else if let message = arguments.message, !message.containsSecretMedia, !hidesIgnored {
+                 for media in message.media {
+                     if let image = media as? TelegramMediaImage {
+                         updatedMediaReference = .message(message: MessageReference(message), media: image)
+diff --git a/submodules/TelegramUI/Components/IgnoredMembers/BUILD b/submodules/TelegramUI/Components/IgnoredMembers/BUILD
+new file mode 100644
+index 0000000000..5ea70765dc
+--- /dev/null
++++ b/submodules/TelegramUI/Components/IgnoredMembers/BUILD
+@@ -0,0 +1,29 @@
++load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
++
++swift_library(
++    name = "IgnoredMembers",
++    module_name = "IgnoredMembers",
++    srcs = glob([
++        "Sources/**/*.swift",
++    ]),
++    copts = [
++        "-warnings-as-errors",
++    ],
++    deps = [
++        "//submodules/AsyncDisplayKit",
++        "//submodules/Display",
++        "//submodules/SSignalKit/SwiftSignalKit",
++        "//submodules/TelegramCore",
++        "//submodules/TelegramPresentationData",
++        "//submodules/TelegramUIPreferences",
++        "//submodules/AccountContext",
++        "//submodules/ContextUI",
++        "//submodules/ComponentFlow",
++        "//submodules/ItemListUI",
++        "//submodules/ItemListPeerItem",
++        "//submodules/PresentationDataUtils",
++    ],
++    visibility = [
++        "//visibility:public",
++    ],
++)
+diff --git a/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreAnimations.swift b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreAnimations.swift
+new file mode 100644
+index 0000000000..811adc4e38
+--- /dev/null
++++ b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreAnimations.swift
+@@ -0,0 +1,310 @@
++import Foundation
++import UIKit
++import CoreText
++import Display
++
++// MARK: - Layer animations
++
++/// A layer coming into focus: from `radius` points of blur to sharp.
++public func ignoreAnimateBlurIn(_ layer: CALayer, radius: CGFloat, duration: Double, delay: Double = 0.0) {
++    // Not on a layer that has filters of its own.
++    guard layer.filters == nil || layer.value(forKey: "ignoreBlur") != nil, let blur = CALayer.blur() else {
++        return
++    }
++    blur.setValue(0.0 as NSNumber, forKey: "inputRadius")
++    layer.filters = [blur]
++    layer.setValue(true, forKey: "ignoreBlur")
++    layer.animate(from: radius as NSNumber, to: 0.0 as NSNumber, keyPath: "filters.gaussianBlur.inputRadius", timingFunction: CAMediaTimingFunctionName.easeOut.rawValue, duration: duration, delay: delay, removeOnCompletion: true, completion: { [weak layer] _ in
++        // Also when the animation is cut short: a blur filter left on a layer costs a pass on every frame.
++        guard let layer, layer.animation(forKey: "filters.gaussianBlur.inputRadius") == nil else {
++            return
++        }
++        layer.filters = nil
++        layer.setValue(nil, forKey: "ignoreBlur")
++    })
++}
++
++/// An element rising into place: up from below, out of a blur, a little larger first.
++public func ignoreAnimateRiseIn(_ layer: CALayer, delay: Double, offset: CGFloat = 18.0, scale: CGFloat = 0.94, blur: CGFloat = 8.0) {
++    layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.28, delay: delay)
++    layer.animateSpring(from: NSValue(cgPoint: CGPoint(x: 0.0, y: offset)), to: NSValue(cgPoint: CGPoint()), keyPath: "position", duration: 0.7, delay: delay, damping: 88.0, additive: true)
++    if scale != 1.0 {
++        layer.animateSpring(from: scale as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.7, delay: delay, damping: 88.0)
++    }
++    if blur > 0.0 {
++        ignoreAnimateBlurIn(layer, radius: blur, duration: 0.36, delay: delay)
++    }
++}
++
++/// A short pop: down a little, over, and back.
++public func ignoreAnimatePop(_ layer: CALayer, from: CGFloat = 0.82, overshoot: CGFloat = 1.12, duration: Double = 0.42) {
++    layer.animateKeyframes(values: [1.0, from, overshoot, 0.98, 1.0].map { $0 as NSNumber }, keyTimes: [0.0, 0.25, 0.55, 0.8, 1.0].map { $0 as NSNumber }, duration: duration, keyPath: "transform.scale", timingFunction: CAMediaTimingFunctionName.easeInEaseOut.rawValue)
++}
++
++/// A soft band of light passing over a layer once, clipped to it.
++public func ignoreAnimateSheen(over view: UIView, cornerRadius: CGFloat, delay: Double, duration: Double = 0.9, alpha: CGFloat = 0.32) {
++    let bounds = view.bounds
++    guard !bounds.isEmpty else {
++        return
++    }
++    let container = CALayer()
++    container.frame = bounds
++    container.cornerRadius = cornerRadius
++    if #available(iOS 13.0, *) {
++        container.cornerCurve = .continuous
++    }
++    container.masksToBounds = true
++
++    let band = CAGradientLayer()
++    band.contentsScale = UIScreenScale
++    let bandWidth = max(80.0, bounds.width * 0.45)
++    band.frame = CGRect(x: -bandWidth, y: -bounds.height * 0.25, width: bandWidth, height: bounds.height * 1.5)
++    band.colors = [UIColor(white: 1.0, alpha: 0.0).cgColor, UIColor(white: 1.0, alpha: alpha).cgColor, UIColor(white: 1.0, alpha: 0.0).cgColor]
++    band.startPoint = CGPoint(x: 0.0, y: 0.5)
++    band.endPoint = CGPoint(x: 1.0, y: 0.5)
++    band.transform = CATransform3DMakeRotation(0.35, 0.0, 0.0, 1.0)
++    container.addSublayer(band)
++    view.layer.addSublayer(container)
++
++    let animation = CABasicAnimation(keyPath: "position.x")
++    animation.fromValue = -bandWidth
++    animation.toValue = bounds.width + bandWidth
++    animation.duration = duration
++    animation.beginTime = band.convertTime(CACurrentMediaTime(), from: nil) + delay
++    animation.fillMode = .both
++    animation.timingFunction = CAMediaTimingFunction(controlPoints: 0.4, 0.0, 0.2, 1.0)
++    animation.isRemovedOnCompletion = false
++    CATransaction.begin()
++    CATransaction.setCompletionBlock({ [weak container] in
++        container?.removeFromSuperlayer()
++    })
++    band.add(animation, forKey: "sheen")
++    CATransaction.commit()
++}
++
++// MARK: - Text that can come in letter by letter
++
++/// Text laid out with Core Text, so that every letter's place is known and the letters can rise in one after another.
++public final class IgnoreTextView: UIView {
++    private struct Glyph {
++        let rect: CGRect
++        let isSpace: Bool
++    }
++
++    private let contentLayer = CALayer()
++    /// The letters of a running animation, if any.
++    private var glyphLayers: CALayer?
++    private var image: UIImage?
++    private var glyphs: [Glyph] = []
++    private var currentText: NSAttributedString?
++    private var currentWidth: CGFloat = 0.0
++    private var currentLines: Int = 0
++    private(set) var textSize: CGSize = .zero
++
++    public override init(frame: CGRect) {
++        super.init(frame: frame)
++        self.isUserInteractionEnabled = false
++        self.layer.addSublayer(self.contentLayer)
++        self.contentLayer.contentsScale = UIScreenScale * 2.0
++    }
++
++    required init?(coder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    /// The size `text` takes within `width`, at most `maxLines` lines.
++    public static func measure(text: NSAttributedString, width: CGFloat, maxLines: Int) -> CGSize {
++        return ignorePlaceLines(text: text, width: width, maxLines: maxLines).size
++    }
++
++    /// Lays the text out within `width`, at most `maxLines` lines (the last one ends with "…"), and returns its size.
++    @discardableResult
++    public func update(text: NSAttributedString, width: CGFloat, maxLines: Int, alignment: NSTextAlignment = .left) -> CGSize {
++        if let currentText = self.currentText, currentText.isEqual(to: text), self.currentWidth == width, self.currentLines == maxLines {
++            return self.textSize
++        }
++        self.currentText = text
++        self.currentWidth = width
++        self.currentLines = maxLines
++        // New text while its letters were still coming in: they go, and the text shows at once.
++        if let glyphLayers = self.glyphLayers {
++            self.glyphLayers = nil
++            CATransaction.begin()
++            CATransaction.setDisableActions(true)
++            glyphLayers.removeFromSuperlayer()
++            self.contentLayer.opacity = 1.0
++            CATransaction.commit()
++        }
++
++        let (placed, size) = ignorePlaceLines(text: text, width: width, maxLines: maxLines)
++        self.textSize = size
++
++        var glyphs: [Glyph] = []
++        let string = text.string as NSString
++        let renderWidth = max(size.width, 1.0)
++        // At twice the screen's resolution: the rows the text is in grow larger than themselves for a while.
++        let image = generateImage(CGSize(width: renderWidth, height: max(size.height, 1.0)), scale: UIScreenScale * 2.0, rotatedContext: { contextSize, context in
++            context.clear(CGRect(origin: CGPoint(), size: contextSize))
++            context.textMatrix = .identity
++            context.translateBy(x: 0.0, y: contextSize.height)
++            context.scaleBy(x: 1.0, y: -1.0)
++            for line in placed {
++                var x: CGFloat = 0.0
++                switch alignment {
++                case .center:
++                    x = floor((renderWidth - line.width) * 0.5)
++                case .right:
++                    x = renderWidth - line.width
++                default:
++                    x = 0.0
++                }
++                context.textPosition = CGPoint(x: x, y: contextSize.height - line.origin.y)
++                CTLineDraw(line.line, context)
++
++                // Every composed character of the line, in the view's coordinates.
++                var index = line.range.location
++                let end = line.range.location + line.range.length
++                let top = line.origin.y - line.ascent
++                // In a line with right-to-left text the letters do not run in the order of the string: the line comes in
++                // as a whole.
++                let runs = (CTLineGetGlyphRuns(line.line) as? [CTRun]) ?? []
++                if runs.contains(where: { CTRunGetStatus($0).contains(.rightToLeft) }) {
++                    glyphs.append(Glyph(rect: CGRect(x: x - 1.0, y: top - 2.0, width: line.width + 2.0, height: line.ascent + line.descent + 4.0), isSpace: false))
++                    continue
++                }
++                var coveredWidth: CGFloat = 0.0
++                while index < end {
++                    let range = string.rangeOfComposedCharacterSequence(at: index)
++                    index = range.location + range.length
++                    let start = CTLineGetOffsetForStringIndex(line.line, range.location, nil)
++                    let next = CTLineGetOffsetForStringIndex(line.line, range.location + range.length, nil)
++                    // A truncated line ends early: the letters past its end are not drawn.
++                    if min(start, next) < coveredWidth - 0.5 || max(start, next) > line.width + 0.5 || next == start {
++                        continue
++                    }
++                    coveredWidth = max(start, next)
++                    let rect = CGRect(x: x + min(start, next) - 1.0, y: top - 2.0, width: abs(next - start) + 2.0, height: line.ascent + line.descent + 4.0)
++                    let character = string.substring(with: range)
++                    glyphs.append(Glyph(rect: rect, isSpace: character.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
++                }
++                if line.width > coveredWidth + 1.0 {
++                    // The ellipsis of a truncated line.
++                    glyphs.append(Glyph(rect: CGRect(x: x + coveredWidth - 1.0, y: top - 2.0, width: line.width - coveredWidth + 2.0, height: line.ascent + line.descent + 4.0), isSpace: false))
++                }
++            }
++        })
++        self.image = image
++        self.glyphs = glyphs
++        self.contentLayer.contents = image?.cgImage
++        self.contentLayer.frame = CGRect(origin: CGPoint(), size: CGSize(width: renderWidth, height: size.height))
++        return size
++    }
++
++    /// The letters come in one after another: each rises, out of a blur. Returns how long it takes.
++    @discardableResult
++    public func animateLettersIn(delay: Double, stagger: Double = 0.018, offset: CGFloat = 9.0) -> Double {
++        guard let image = self.image?.cgImage, !self.glyphs.isEmpty else {
++            return 0.0
++        }
++        let scale = CGFloat(image.width) / max(1.0, self.contentLayer.bounds.width)
++        self.glyphLayers?.removeFromSuperlayer()
++        let glyphLayers = CALayer()
++        glyphLayers.frame = self.contentLayer.frame
++        self.glyphLayers = glyphLayers
++        // At once: an implicit fade of the whole text would show over the letters coming in.
++        CATransaction.begin()
++        CATransaction.setDisableActions(true)
++        self.layer.addSublayer(glyphLayers)
++        self.contentLayer.opacity = 0.0
++        CATransaction.commit()
++
++        var visibleIndex = 0
++        for glyph in self.glyphs where !glyph.isSpace {
++            let cropRect = CGRect(x: glyph.rect.minX * scale, y: glyph.rect.minY * scale, width: glyph.rect.width * scale, height: glyph.rect.height * scale).integral.intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height))
++            guard !cropRect.isEmpty, let cropped = image.cropping(to: cropRect) else {
++                continue
++            }
++            let layer = CALayer()
++            layer.contents = cropped
++            layer.contentsScale = scale
++            layer.frame = CGRect(x: cropRect.minX / scale, y: cropRect.minY / scale, width: cropRect.width / scale, height: cropRect.height / scale)
++            layer.opacity = 0.0
++            glyphLayers.addSublayer(layer)
++
++            let letterDelay = delay + Double(visibleIndex) * stagger
++            layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.2, delay: letterDelay, removeOnCompletion: false)
++            layer.animateSpring(from: NSValue(cgPoint: CGPoint(x: 0.0, y: offset)), to: NSValue(cgPoint: CGPoint()), keyPath: "position", duration: 0.55, delay: letterDelay, damping: 70.0, additive: true)
++            layer.animateSpring(from: 1.3 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.55, delay: letterDelay, damping: 70.0)
++            ignoreAnimateBlurIn(layer, radius: 5.0, duration: 0.3, delay: letterDelay)
++            visibleIndex += 1
++        }
++        let total = delay + Double(max(0, visibleIndex - 1)) * stagger + 0.5
++        DispatchQueue.main.asyncAfter(deadline: .now() + total, execute: { [weak self, weak glyphLayers] in
++            guard let self, let glyphLayers, self.glyphLayers === glyphLayers else {
++                return
++            }
++            self.glyphLayers = nil
++            CATransaction.begin()
++            CATransaction.setDisableActions(true)
++            self.contentLayer.opacity = 1.0
++            glyphLayers.removeFromSuperlayer()
++            CATransaction.commit()
++        })
++        return total
++    }
++
++}
++
++private func ignorePlaceLines(text: NSAttributedString, width: CGFloat, maxLines: Int) -> (placed: [(line: CTLine, origin: CGPoint, width: CGFloat, ascent: CGFloat, descent: CGFloat, range: CFRange)], size: CGSize) {
++    let lines = ignoreLayoutLines(text: text, width: width, maxLines: maxLines)
++    var height: CGFloat = 0.0
++    var maxWidth: CGFloat = 0.0
++    var placed: [(line: CTLine, origin: CGPoint, width: CGFloat, ascent: CGFloat, descent: CGFloat, range: CFRange)] = []
++    for line in lines {
++        var ascent: CGFloat = 0.0
++        var descent: CGFloat = 0.0
++        var leading: CGFloat = 0.0
++        let lineWidth = CGFloat(CTLineGetTypographicBounds(line.line, &ascent, &descent, &leading))
++        let lineHeight = ceil(ascent + descent) + (placed.isEmpty ? 0.0 : floor(leading + 2.0))
++        height += lineHeight
++        placed.append((line.line, CGPoint(x: 0.0, y: height - descent), lineWidth, ascent, descent, line.range))
++        maxWidth = max(maxWidth, lineWidth)
++    }
++    return (placed, CGSize(width: ceil(maxWidth), height: ceil(height)))
++}
++
++private func ignoreLayoutLines(text: NSAttributedString, width: CGFloat, maxLines: Int) -> [(line: CTLine, range: CFRange)] {
++    let typesetter = CTTypesetterCreateWithAttributedString(text as CFAttributedString)
++    let length = text.length
++    var result: [(line: CTLine, range: CFRange)] = []
++    var start = 0
++    while start < length {
++        let isLast = maxLines > 0 && result.count == maxLines - 1
++        var count = CTTypesetterSuggestLineBreak(typesetter, start, Double(width))
++        if count <= 0 {
++            count = length - start
++        }
++        // A hard line break ends the line without being drawn.
++        let substring = (text.string as NSString).substring(with: NSRange(location: start, length: count))
++        var drawnCount = count
++        if substring.hasSuffix("\n") {
++            drawnCount -= 1
++        }
++        if isLast && start + count < length {
++            let rest = text.attributedSubstring(from: NSRange(location: start, length: length - start))
++            let restLine = CTLineCreateWithAttributedString(rest as CFAttributedString)
++            let ellipsisAttributes = rest.length > 0 ? rest.attributes(at: 0, effectiveRange: nil) : [:]
++            let token = CTLineCreateWithAttributedString(NSAttributedString(string: "…", attributes: ellipsisAttributes) as CFAttributedString)
++            let truncated = CTLineCreateTruncatedLine(restLine, Double(width), .end, token) ?? restLine
++            result.append((truncated, CFRange(location: start, length: length - start)))
++            break
++        }
++        let line = CTTypesetterCreateLine(typesetter, CFRange(location: start, length: drawnCount))
++        result.append((line, CFRange(location: start, length: drawnCount)))
++        start += count
++        if maxLines > 0 && result.count >= maxLines {
++            break
++        }
++    }
++    return result
++}
+diff --git a/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreEffects.swift b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreEffects.swift
+new file mode 100644
+index 0000000000..e21e93dd7e
+--- /dev/null
++++ b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreEffects.swift
+@@ -0,0 +1,359 @@
++import Foundation
++import UIKit
++import Display
++import AsyncDisplayKit
++
++/// What a view (a part of it) looks like now, as an image, and where in it something is drawn (its bubble).
++public struct IgnoreSnapshot {
++    public let image: UIImage
++    /// The part of the view the image shows, in the view's coordinates.
++    public let rect: CGRect
++    /// The part of the image that is not transparent, in the image's coordinates.
++    public let contentRect: CGRect
++
++    /// Draws `view` (the part `rect` of it, or all of it) as it is on screen now, or (`renderLayer`) as its layers are
++    /// now, also before it has been shown (it is drawn as if it were visible). Nil if it has nothing to draw.
++    public static func take(of view: UIView, in rect: CGRect? = nil, renderLayer: Bool = false) -> IgnoreSnapshot? {
++        let bounds = view.bounds
++        let rect = (rect ?? bounds).intersection(bounds).integral
++        guard rect.width >= 1.0, rect.height >= 1.0 else {
++            return nil
++        }
++        let format = UIGraphicsImageRendererFormat()
++        format.scale = UIScreenScale
++        format.opaque = false
++        let image = UIGraphicsImageRenderer(bounds: rect, format: format).image { context in
++            if renderLayer {
++                let wasHidden = view.isHidden
++                let alpha = view.alpha
++                CATransaction.begin()
++                CATransaction.setDisableActions(true)
++                view.isHidden = false
++                view.alpha = 1.0
++                view.layer.render(in: context.cgContext)
++                view.alpha = alpha
++                view.isHidden = wasHidden
++                CATransaction.commit()
++            } else if !view.drawHierarchy(in: bounds, afterScreenUpdates: false) {
++                view.layer.render(in: context.cgContext)
++            }
++        }
++        guard let contentRect = IgnoreSnapshot.opaqueBounds(of: image) else {
++            return nil
++        }
++        return IgnoreSnapshot(image: image, rect: rect, contentRect: contentRect)
++    }
++
++    /// The pixels of `image` drawn at a quarter of its size (or `factor`), RGBA, rows from the top.
++    private static func pixels(of image: UIImage, factor: Int) -> (pixels: [UInt8], width: Int, height: Int)? {
++        guard let cgImage = image.cgImage else {
++            return nil
++        }
++        let width = max(1, cgImage.width / factor)
++        let height = max(1, cgImage.height / factor)
++        var pixels = [UInt8](repeating: 0, count: width * height * 4)
++        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
++            guard let context = CGContext(data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
++                return false
++            }
++            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
++            return true
++        }
++        return drawn ? (pixels, width, height) : nil
++    }
++
++    /// The bounds of the pixels that are not (almost) transparent, in points; looked for on a smaller copy.
++    private static func opaqueBounds(of image: UIImage) -> CGRect? {
++        guard let (pixels, width, height) = IgnoreSnapshot.pixels(of: image, factor: 4) else {
++            return nil
++        }
++        var minX = width
++        var minY = height
++        var maxX = -1
++        var maxY = -1
++        for y in 0 ..< height {
++            for x in 0 ..< width where pixels[(y * width + x) * 4 + 3] > 24 {
++                minX = min(minX, x)
++                maxX = max(maxX, x)
++                minY = min(minY, y)
++                maxY = max(maxY, y)
++            }
++        }
++        guard maxX >= minX, maxY >= minY else {
++            return nil
++        }
++        // The first row of a bitmap context's memory is the top of what is drawn into it.
++        let pointsPerPixel = image.size.width / CGFloat(width)
++        let rect = CGRect(x: CGFloat(minX) * pointsPerPixel, y: CGFloat(minY) * pointsPerPixel, width: CGFloat(maxX - minX + 1) * pointsPerPixel, height: CGFloat(maxY - minY + 1) * pointsPerPixel)
++        return rect.intersection(CGRect(origin: CGPoint(), size: image.size))
++    }
++
++    /// Up to `count` points inside the content (in the image's coordinates) with the colors drawn there, spread over
++    /// it; read from a smaller copy.
++    func samples(count: Int) -> [(point: CGPoint, color: UIColor)] {
++        guard count > 0, let (pixels, width, height) = IgnoreSnapshot.pixels(of: self.image, factor: 3) else {
++            return []
++        }
++        let scale = CGFloat(width) / max(1.0, self.image.size.width)
++        var result: [(point: CGPoint, color: UIColor)] = []
++        var attempts = 0
++        var generator = SystemRandomNumberGenerator()
++        while result.count < count && attempts < count * 12 {
++            attempts += 1
++            let point = CGPoint(x: self.contentRect.minX + CGFloat.random(in: 0.0 ... 1.0, using: &generator) * self.contentRect.width, y: self.contentRect.minY + CGFloat.random(in: 0.0 ... 1.0, using: &generator) * self.contentRect.height)
++            let px = min(width - 1, max(0, Int(point.x * scale)))
++            let py = min(height - 1, max(0, Int(point.y * scale)))
++            let offset = (py * width + px) * 4
++            let alpha = CGFloat(pixels[offset + 3]) / 255.0
++            guard alpha > 0.5 else {
++                continue
++            }
++            let color = UIColor(red: CGFloat(pixels[offset]) / 255.0 / alpha, green: CGFloat(pixels[offset + 1]) / 255.0 / alpha, blue: CGFloat(pixels[offset + 2]) / 255.0 / alpha, alpha: 1.0)
++            result.append((point, color))
++        }
++        return result
++    }
++}
++
++/// The colors of the effect.
++public struct IgnoreEffectStyle {
++    public let badgeColor: UIColor
++    public let glyphColor: UIColor
++
++    public init(badgeColor: UIColor, glyphColor: UIColor) {
++        self.badgeColor = badgeColor
++        self.glyphColor = glyphColor
++    }
++}
++
++private let ignoreEffectBadgeSize: CGFloat = 34.0
++
++/// The eye that the effect gathers a message into (or lets it out of): a round badge with the eye on it.
++private final class IgnoreEffectBadge {
++    let view = UIView()
++    let eye: IgnoreEyeView
++
++    init(style: IgnoreEffectStyle, isSlashed: Bool) {
++        self.eye = IgnoreEyeView(isSlashed: isSlashed)
++        self.view.frame = CGRect(x: 0.0, y: 0.0, width: ignoreEffectBadgeSize, height: ignoreEffectBadgeSize)
++        self.view.layer.cornerRadius = ignoreEffectBadgeSize * 0.5
++        self.view.backgroundColor = style.badgeColor
++        self.view.layer.shadowColor = UIColor.black.cgColor
++        self.view.layer.shadowOpacity = 0.18
++        self.view.layer.shadowRadius = 6.0
++        self.view.layer.shadowOffset = CGSize(width: 0.0, height: 2.0)
++        self.eye.color = style.glyphColor
++        self.eye.lineWidth = 2.0
++        self.eye.frame = CGRect(x: 7.0, y: 7.0, width: 20.0, height: 20.0)
++        self.view.addSubview(self.eye)
++        self.view.isUserInteractionEnabled = false
++    }
++}
++
++/// A ring going out from `center` and fading.
++private func ignoreRingBurst(in container: UIView, center: CGPoint, color: UIColor, radius: CGFloat, delay: Double) {
++    let ring = CAShapeLayer()
++    ring.contentsScale = UIScreenScale * 2.0
++    ring.path = UIBezierPath(arcCenter: CGPoint(), radius: radius, startAngle: 0.0, endAngle: .pi * 2.0, clockwise: true).cgPath
++    ring.position = center
++    ring.fillColor = UIColor.clear.cgColor
++    ring.strokeColor = color.cgColor
++    ring.lineWidth = 2.0
++    ring.opacity = 0.0
++    container.layer.addSublayer(ring)
++    ignoreAddKeyframes(ring, keyPath: "transform.scale", values: [0.5, 1.8], keyTimes: [0.0, 1.0], duration: 0.55, delay: delay, timing: .easeOut)
++    ignoreAddKeyframes(ring, keyPath: "opacity", values: [0.0, 0.8, 0.0], keyTimes: [0.0, 0.2, 1.0], duration: 0.55, delay: delay, timing: .easeOut)
++}
++
++/// A message being ignored: the eye pops up over it, the message is drawn into the eye (it narrows, blurs and fades
++/// while its pieces swirl into the eye), the eye blinks, is crossed out and goes with a ring. `snapshot` is the
++/// message drawn at `frame` (in `container`'s coordinates); `extra` are more parts of it (its avatar) to take along.
++/// Everything it adds to `container` is removed when it is done; returns how long it takes from now.
++@discardableResult
++public func ignorePlayDissolve(snapshot: IgnoreSnapshot, frame: CGRect, extra: [(snapshot: IgnoreSnapshot, frame: CGRect)] = [], in container: UIView, style: IgnoreEffectStyle, delay: Double) -> Double {
++    let host = UIView(frame: container.bounds)
++    host.isUserInteractionEnabled = false
++    container.addSubview(host)
++
++    let content = snapshot.contentRect.offsetBy(dx: frame.minX, dy: frame.minY)
++    let center = CGPoint(x: content.midX, y: content.midY)
++    // Until the last ring has gone.
++    let end = delay + 1.5
++    DispatchQueue.main.asyncAfter(deadline: .now() + end, execute: { [weak host] in
++        host?.removeFromSuperview()
++    })
++
++    // The message itself, from now on drawn by the effect.
++    let bubble = CALayer()
++    bubble.contents = snapshot.image.cgImage
++    bubble.contentsScale = snapshot.image.scale
++    bubble.frame = frame
++    // Narrowing towards the middle of the bubble, not of the row.
++    let anchor = CGPoint(x: (center.x - frame.minX) / max(1.0, frame.width), y: (center.y - frame.minY) / max(1.0, frame.height))
++    bubble.anchorPoint = anchor
++    bubble.position = center
++    host.layer.addSublayer(bubble)
++
++    if UIAccessibility.isReduceMotionEnabled {
++        ignoreAddKeyframes(bubble, keyPath: "opacity", values: [1.0, 0.0], keyTimes: [0.0, 1.0], duration: 0.3, delay: delay)
++        return end
++    }
++
++    // A little lift first, then drawn in: narrower and flatter, blurred, gone.
++    ignoreAddKeyframes(bubble, keyPath: "transform.scale.x", values: [1.0, 1.04, 0.62, 0.12], keyTimes: [0.0, 0.14, 0.55, 1.0], duration: 0.72, delay: delay, timing: .easeIn)
++    ignoreAddKeyframes(bubble, keyPath: "transform.scale.y", values: [1.0, 1.06, 0.7, 0.3], keyTimes: [0.0, 0.14, 0.55, 1.0], duration: 0.72, delay: delay, timing: .easeIn)
++    ignoreAddKeyframes(bubble, keyPath: "opacity", values: [1.0, 1.0, 0.85, 0.0], keyTimes: [0.0, 0.3, 0.7, 1.0], duration: 0.72, delay: delay)
++    if let blur = CALayer.blur() {
++        blur.setValue(0.0 as NSNumber, forKey: "inputRadius")
++        bubble.filters = [blur]
++        ignoreAddKeyframes(bubble, keyPath: "filters.gaussianBlur.inputRadius", values: [0.0, 0.0, 6.0, 14.0], keyTimes: [0.0, 0.18, 0.6, 1.0], duration: 0.72, delay: delay, timing: .easeIn)
++    }
++
++    // The rest of it (its avatar) goes the same way.
++    for (part, partFrame) in extra {
++        let layer = CALayer()
++        layer.contents = part.image.cgImage
++        layer.contentsScale = part.image.scale
++        layer.frame = partFrame
++        host.layer.addSublayer(layer)
++        ignoreAddKeyframes(layer, keyPath: "transform.scale", values: [1.0, 1.08, 0.2], keyTimes: [0.0, 0.2, 1.0], duration: 0.6, delay: delay + 0.08, timing: .easeIn)
++        ignoreAddKeyframes(layer, keyPath: "opacity", values: [1.0, 1.0, 0.0], keyTimes: [0.0, 0.4, 1.0], duration: 0.6, delay: delay + 0.08)
++        let target = CGPoint(x: center.x - layer.position.x, y: center.y - layer.position.y)
++        ignoreAddKeyframes(layer, keyPath: "transform.translation", values: [NSValue(cgPoint: CGPoint()), NSValue(cgPoint: CGPoint(x: target.x * 0.35, y: target.y * 0.35))], keyTimes: [0.0, 1.0], duration: 0.6, delay: delay + 0.08, timing: .easeIn)
++    }
++
++    // Its pieces swirl into the eye.
++    let pieces = snapshot.samples(count: 46)
++    for (index, piece) in pieces.enumerated() {
++        let start = CGPoint(x: frame.minX + piece.point.x, y: frame.minY + piece.point.y)
++        let size = CGFloat.random(in: 2.0 ... 4.2)
++        let layer = CALayer()
++        layer.bounds = CGRect(x: 0.0, y: 0.0, width: size, height: size)
++        layer.cornerRadius = size * (index % 3 == 0 ? 0.5 : 0.2)
++        layer.backgroundColor = piece.color.cgColor
++        layer.position = start
++        layer.opacity = 0.0
++        host.layer.addSublayer(layer)
++        // A curved way in: out to the side first, then into the middle.
++        let dx = center.x - start.x
++        let dy = center.y - start.y
++        let side: CGFloat = index % 2 == 0 ? 1.0 : -1.0
++        let swirl = CGPoint(x: start.x + dx * 0.45 - dy * 0.35 * side, y: start.y + dy * 0.45 + dx * 0.12 * side - 10.0)
++        let path = UIBezierPath()
++        path.move(to: start)
++        path.addQuadCurve(to: center, controlPoint: swirl)
++        let move = CAKeyframeAnimation(keyPath: "position")
++        move.path = path.cgPath
++        move.duration = Double.random(in: 0.5 ... 0.7)
++        move.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil) + delay + 0.1 + Double(index % 9) * 0.012
++        move.timingFunction = CAMediaTimingFunction(name: .easeIn)
++        move.fillMode = .both
++        move.isRemovedOnCompletion = false
++        layer.add(move, forKey: "position")
++        ignoreAddKeyframes(layer, keyPath: "opacity", values: [0.0, 1.0, 1.0, 0.0], keyTimes: [0.0, 0.15, 0.75, 1.0], duration: move.duration, delay: delay + 0.1 + Double(index % 9) * 0.012)
++        ignoreAddKeyframes(layer, keyPath: "transform.scale", values: [1.3, 1.0, 0.3], keyTimes: [0.0, 0.4, 1.0], duration: move.duration, delay: delay + 0.1 + Double(index % 9) * 0.012)
++    }
++
++    // The eye: pops up, takes the message in, blinks, is crossed out, goes with a ring.
++    let badge = IgnoreEffectBadge(style: style, isSlashed: false)
++    badge.view.center = center
++    host.addSubview(badge.view)
++    badge.view.alpha = 0.0
++    ignoreAddKeyframes(badge.view.layer, keyPath: "opacity", values: [0.0, 1.0, 1.0, 0.0], keyTimes: [0.0, 0.1, 0.82, 1.0], duration: 1.15, delay: delay + 0.06)
++    ignoreAddKeyframes(badge.view.layer, keyPath: "transform.scale", values: [0.1, 1.25, 0.95, 1.0, 1.0, 1.28, 0.1], keyTimes: [0.0, 0.16, 0.26, 0.34, 0.7, 0.82, 1.0], duration: 1.15, delay: delay + 0.06)
++    ignoreAddKeyframes(badge.view.layer, keyPath: "transform.rotation.z", values: [-0.6, 0.12, 0.0, 0.0, -0.25], keyTimes: [0.0, 0.2, 0.34, 0.8, 1.0], duration: 1.15, delay: delay + 0.06)
++    badge.eye.blink(delay: delay + 0.62, duration: 0.24)
++    badge.eye.setSlashed(true, animated: true, delay: delay + 0.74, duration: 0.2)
++    ignoreRingBurst(in: host, center: center, color: style.badgeColor, radius: ignoreEffectBadgeSize * 0.5, delay: delay + 0.9)
++    return end
++}
++
++/// A message coming back as someone is no longer ignored: the crossed out eye pops up where it will be, the slash comes
++/// off and the eye opens, then the message comes out of it: pieces fly out to their places and the message unfolds out
++/// of a blur, a little large, and settles. `node` is the message's own node (shown again at the end).
++@discardableResult
++public func ignorePlayReassemble(node: ASDisplayNode, snapshot: IgnoreSnapshot, in container: UIView, style: IgnoreEffectStyle, delay: Double) -> Double {
++    let frame = node.view.convert(snapshot.rect, to: container)
++    let host = UIView(frame: container.bounds)
++    host.isUserInteractionEnabled = false
++    container.addSubview(host)
++
++    let content = snapshot.contentRect.offsetBy(dx: frame.minX, dy: frame.minY)
++    let center = CGPoint(x: content.midX, y: content.midY)
++    let end = delay + 1.3
++    node.isHidden = true
++
++    let bubble = CALayer()
++    bubble.contents = snapshot.image.cgImage
++    bubble.contentsScale = snapshot.image.scale
++    bubble.frame = frame
++    bubble.anchorPoint = CGPoint(x: (center.x - frame.minX) / max(1.0, frame.width), y: (center.y - frame.minY) / max(1.0, frame.height))
++    bubble.position = center
++    bubble.opacity = 0.0
++    host.layer.addSublayer(bubble)
++
++    // At the end the message itself takes over from the effect.
++    DispatchQueue.main.asyncAfter(deadline: .now() + end, execute: { [weak host, weak node] in
++        node?.isHidden = false
++        host?.removeFromSuperview()
++    })
++
++    if UIAccessibility.isReduceMotionEnabled {
++        ignoreAddKeyframes(bubble, keyPath: "opacity", values: [0.0, 1.0], keyTimes: [0.0, 1.0], duration: 0.3, delay: delay)
++        return end
++    }
++
++    let open = delay + 0.42
++    // The eye: pops up crossed out, the slash comes off, it opens; it goes as the message comes out.
++    let badge = IgnoreEffectBadge(style: style, isSlashed: true)
++    badge.view.center = center
++    host.addSubview(badge.view)
++    ignoreAddKeyframes(badge.view.layer, keyPath: "opacity", values: [0.0, 1.0, 1.0, 0.0], keyTimes: [0.0, 0.12, 0.6, 0.85], duration: 1.1, delay: delay)
++    ignoreAddKeyframes(badge.view.layer, keyPath: "transform.scale", values: [0.1, 1.25, 0.95, 1.0, 1.3, 0.2], keyTimes: [0.0, 0.18, 0.3, 0.45, 0.6, 0.85], duration: 1.1, delay: delay)
++    badge.eye.setSlashed(false, animated: true, delay: delay + 0.24, duration: 0.2)
++    badge.eye.popIris(delay: delay + 0.4)
++    ignoreRingBurst(in: host, center: center, color: style.badgeColor, radius: ignoreEffectBadgeSize * 0.5, delay: open)
++
++    // The message unfolds out of the eye: from narrow and blurred to itself, a little large first.
++    ignoreAddKeyframes(bubble, keyPath: "opacity", values: [0.0, 1.0, 1.0], keyTimes: [0.0, 0.25, 1.0], duration: 0.8, delay: open)
++    ignoreAddKeyframes(bubble, keyPath: "transform.scale.x", values: [0.12, 0.7, 1.06, 0.98, 1.0], keyTimes: [0.0, 0.3, 0.6, 0.82, 1.0], duration: 0.8, delay: open, timing: .easeOut)
++    ignoreAddKeyframes(bubble, keyPath: "transform.scale.y", values: [0.3, 0.75, 1.08, 0.98, 1.0], keyTimes: [0.0, 0.3, 0.6, 0.82, 1.0], duration: 0.8, delay: open, timing: .easeOut)
++    if let blur = CALayer.blur() {
++        blur.setValue(0.0 as NSNumber, forKey: "inputRadius")
++        bubble.filters = [blur]
++        ignoreAddKeyframes(bubble, keyPath: "filters.gaussianBlur.inputRadius", values: [14.0, 5.0, 0.0, 0.0], keyTimes: [0.0, 0.35, 0.65, 1.0], duration: 0.8, delay: open, timing: .easeOut)
++    }
++
++    // Its pieces fly out of the eye to their places.
++    let pieces = snapshot.samples(count: 40)
++    for (index, piece) in pieces.enumerated() {
++        let target = CGPoint(x: frame.minX + piece.point.x, y: frame.minY + piece.point.y)
++        let size = CGFloat.random(in: 2.0 ... 4.0)
++        let layer = CALayer()
++        layer.bounds = CGRect(x: 0.0, y: 0.0, width: size, height: size)
++        layer.cornerRadius = size * (index % 3 == 0 ? 0.5 : 0.2)
++        layer.backgroundColor = piece.color.cgColor
++        layer.position = target
++        layer.opacity = 0.0
++        host.layer.addSublayer(layer)
++        let dx = target.x - center.x
++        let dy = target.y - center.y
++        let side: CGFloat = index % 2 == 0 ? 1.0 : -1.0
++        let control = CGPoint(x: center.x + dx * 0.55 + dy * 0.3 * side, y: center.y + dy * 0.55 - dx * 0.1 * side - 12.0)
++        let path = UIBezierPath()
++        path.move(to: center)
++        path.addQuadCurve(to: target, controlPoint: control)
++        let pieceDelay = open - 0.04 + Double(index % 9) * 0.012
++        let move = CAKeyframeAnimation(keyPath: "position")
++        move.path = path.cgPath
++        move.duration = Double.random(in: 0.42 ... 0.6)
++        move.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil) + pieceDelay
++        move.timingFunction = CAMediaTimingFunction(name: .easeOut)
++        move.fillMode = .both
++        move.isRemovedOnCompletion = false
++        layer.add(move, forKey: "position")
++        ignoreAddKeyframes(layer, keyPath: "opacity", values: [0.0, 1.0, 1.0, 0.0], keyTimes: [0.0, 0.15, 0.7, 1.0], duration: move.duration, delay: pieceDelay)
++        ignoreAddKeyframes(layer, keyPath: "transform.scale", values: [0.3, 1.2, 0.8], keyTimes: [0.0, 0.5, 1.0], duration: move.duration, delay: pieceDelay)
++    }
++    return end
++}
+diff --git a/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreEyeView.swift b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreEyeView.swift
+new file mode 100644
+index 0000000000..68b2352e20
+--- /dev/null
++++ b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreEyeView.swift
+@@ -0,0 +1,178 @@
++import Foundation
++import UIKit
++import Display
++
++/// An eye that can be crossed out (someone ignored) or open again. Drawn on a 24-point grid and scaled to the view, so
++/// that every part can move: the eye blinks, the slash is drawn across it (cutting a gap through the eye as it goes) or
++/// taken back, the iris pops.
++public final class IgnoreEyeView: UIView {
++    private static let grid: CGFloat = 24.0
++    private static let slashStart = CGPoint(x: 4.0, y: 3.5)
++    private static let slashEnd = CGPoint(x: 20.0, y: 20.5)
++
++    private let canvas = CALayer()
++    private let eyeContainer = CALayer()
++    private let outlineLayer = CAShapeLayer()
++    private let irisLayer = CAShapeLayer()
++    private let gapMask = CAShapeLayer()
++    private let slashLayer = CAShapeLayer()
++
++    public private(set) var isSlashed: Bool
++    public var lineWidth: CGFloat = 1.8 {
++        didSet {
++            self.updatePaths()
++        }
++    }
++    public var color: UIColor = .black {
++        didSet {
++            self.outlineLayer.strokeColor = self.color.cgColor
++            self.irisLayer.strokeColor = self.color.cgColor
++            self.irisLayer.fillColor = self.color.cgColor
++            self.slashLayer.strokeColor = self.color.cgColor
++        }
++    }
++
++    public init(isSlashed: Bool) {
++        self.isSlashed = isSlashed
++        super.init(frame: CGRect())
++        self.isUserInteractionEnabled = false
++        self.layer.addSublayer(self.canvas)
++        self.canvas.addSublayer(self.eyeContainer)
++        self.eyeContainer.addSublayer(self.outlineLayer)
++        self.eyeContainer.addSublayer(self.irisLayer)
++        self.eyeContainer.mask = self.gapMask
++        self.canvas.addSublayer(self.slashLayer)
++        for layer in [self.outlineLayer, self.slashLayer] {
++            layer.fillColor = UIColor.clear.cgColor
++            layer.lineCap = .round
++            layer.lineJoin = .round
++        }
++        self.irisLayer.lineCap = .round
++        self.gapMask.fillRule = .evenOdd
++        self.gapMask.fillColor = UIColor.white.cgColor
++        // Set directly: didSet does not run in an initializer.
++        self.outlineLayer.strokeColor = self.color.cgColor
++        self.irisLayer.strokeColor = self.color.cgColor
++        self.irisLayer.fillColor = self.color.cgColor
++        self.slashLayer.strokeColor = self.color.cgColor
++        self.updatePaths()
++    }
++
++    required init?(coder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    override public func layoutSubviews() {
++        super.layoutSubviews()
++        let scale = self.bounds.width / IgnoreEyeView.grid
++        CATransaction.begin()
++        CATransaction.setDisableActions(true)
++        self.canvas.bounds = CGRect(x: 0.0, y: 0.0, width: IgnoreEyeView.grid, height: IgnoreEyeView.grid)
++        self.canvas.position = CGPoint(x: self.bounds.midX, y: self.bounds.midY)
++        self.canvas.transform = CATransform3DMakeScale(scale, scale, 1.0)
++        // The paths are drawn on a 24-point grid that is then scaled up to the view: they are drawn at the screen's
++        // resolution of what is shown, twice over (the eye pops larger than itself and its row grows).
++        let contentsScale = UIScreenScale * max(1.0, scale) * 2.0
++        for layer in [self.canvas, self.eyeContainer, self.outlineLayer, self.irisLayer, self.gapMask, self.slashLayer] {
++            layer.contentsScale = contentsScale
++            layer.rasterizationScale = contentsScale
++        }
++        for layer in [self.eyeContainer, self.outlineLayer, self.irisLayer, self.gapMask, self.slashLayer] {
++            layer.frame = CGRect(x: 0.0, y: 0.0, width: IgnoreEyeView.grid, height: IgnoreEyeView.grid)
++        }
++        CATransaction.commit()
++    }
++
++    private func updatePaths() {
++        let outline = UIBezierPath()
++        outline.move(to: CGPoint(x: 1.8, y: 12.0))
++        outline.addQuadCurve(to: CGPoint(x: 22.2, y: 12.0), controlPoint: CGPoint(x: 12.0, y: 1.6))
++        outline.addQuadCurve(to: CGPoint(x: 1.8, y: 12.0), controlPoint: CGPoint(x: 12.0, y: 22.4))
++        outline.close()
++        self.outlineLayer.path = outline.cgPath
++        self.outlineLayer.lineWidth = self.lineWidth
++        self.irisLayer.path = UIBezierPath(arcCenter: CGPoint(x: 12.0, y: 12.0), radius: 3.3, startAngle: 0.0, endAngle: .pi * 2.0, clockwise: true).cgPath
++        self.irisLayer.lineWidth = 0.0
++
++        let slash = UIBezierPath()
++        slash.move(to: IgnoreEyeView.slashStart)
++        slash.addLine(to: IgnoreEyeView.slashEnd)
++        self.slashLayer.path = slash.cgPath
++        self.slashLayer.lineWidth = self.lineWidth
++        self.slashLayer.strokeEnd = self.isSlashed ? 1.0 : 0.0
++        // A line of no length still draws its round cap as a dot: the slash is hidden while it is not there.
++        self.slashLayer.opacity = self.isSlashed ? 1.0 : 0.0
++        self.gapMask.path = self.gapPath(progress: self.isSlashed ? 1.0 : 0.0)
++    }
++
++    /// The whole grid with a band cut along the slash, as far as `progress` of its length.
++    private func gapPath(progress: CGFloat) -> CGPath {
++        let path = UIBezierPath(rect: CGRect(x: -4.0, y: -4.0, width: IgnoreEyeView.grid + 8.0, height: IgnoreEyeView.grid + 8.0))
++        let start = IgnoreEyeView.slashStart
++        let end = CGPoint(x: start.x + (IgnoreEyeView.slashEnd.x - start.x) * progress, y: start.y + (IgnoreEyeView.slashEnd.y - start.y) * progress)
++        let dx = IgnoreEyeView.slashEnd.x - start.x
++        let dy = IgnoreEyeView.slashEnd.y - start.y
++        let length = max(0.001, sqrt(dx * dx + dy * dy))
++        // Perpendicular, wide enough for the slash and a gap on each side of it.
++        let half = self.lineWidth * 0.5 + self.lineWidth * 1.1
++        let nx = -dy / length * half
++        let ny = dx / length * half
++        let band = UIBezierPath()
++        band.move(to: CGPoint(x: start.x + nx, y: start.y + ny))
++        band.addLine(to: CGPoint(x: end.x + nx, y: end.y + ny))
++        band.addLine(to: CGPoint(x: end.x - nx, y: end.y - ny))
++        band.addLine(to: CGPoint(x: start.x - nx, y: start.y - ny))
++        band.close()
++        path.append(band)
++        return path.cgPath
++    }
++
++    /// Crosses the eye out or opens it again.
++    public func setSlashed(_ isSlashed: Bool, animated: Bool, delay: Double = 0.0, duration: Double = 0.36) {
++        guard self.isSlashed != isSlashed || !animated else {
++            return
++        }
++        self.isSlashed = isSlashed
++        let to: CGFloat = isSlashed ? 1.0 : 0.0
++        let from: CGFloat = isSlashed ? 0.0 : 1.0
++        self.slashLayer.strokeEnd = to
++        self.slashLayer.opacity = isSlashed ? 1.0 : 0.0
++        self.gapMask.path = self.gapPath(progress: to)
++        guard animated, !UIAccessibility.isReduceMotionEnabled else {
++            return
++        }
++        // Shown from the moment it starts to be drawn, until the moment it is fully taken back (no dot either side).
++        if isSlashed {
++            ignoreAddKeyframes(self.slashLayer, keyPath: "opacity", values: [0.0 as NSNumber, 1.0 as NSNumber, 1.0 as NSNumber], keyTimes: [0.0, 0.02, 1.0], duration: duration, delay: delay, timing: .linear)
++        } else {
++            ignoreAddKeyframes(self.slashLayer, keyPath: "opacity", values: [1.0 as NSNumber, 1.0 as NSNumber, 0.0 as NSNumber], keyTimes: [0.0, 0.98, 1.0], duration: duration, delay: delay, timing: .linear)
++        }
++        let timing: CAMediaTimingFunctionName = isSlashed ? .easeOut : .easeIn
++        ignoreAddKeyframes(self.slashLayer, keyPath: "strokeEnd", values: [from as NSNumber, to as NSNumber], keyTimes: [0.0, 1.0], duration: duration, delay: delay, timing: timing)
++        let steps = 8
++        var paths: [Any] = []
++        var times: [NSNumber] = []
++        for step in 0 ... steps {
++            let t = CGFloat(step) / CGFloat(steps)
++            paths.append(self.gapPath(progress: from + (to - from) * t))
++            times.append(NSNumber(value: Double(t)))
++        }
++        ignoreAddKeyframes(self.gapMask, keyPath: "path", values: paths, keyTimes: times, duration: duration, delay: delay, timing: timing)
++    }
++
++    /// The eye closes for a moment and opens again.
++    public func blink(delay: Double = 0.0, duration: Double = 0.32) {
++        guard !UIAccessibility.isReduceMotionEnabled else {
++            return
++        }
++        ignoreAddKeyframes(self.eyeContainer, keyPath: "transform.scale.y", values: [1.0, 0.08, 1.0], keyTimes: [0.0, 0.45, 1.0], duration: duration, delay: delay)
++    }
++
++    /// The iris grows and settles (the eye looks again).
++    public func popIris(delay: Double = 0.0) {
++        guard !UIAccessibility.isReduceMotionEnabled else {
++            return
++        }
++        ignoreAddKeyframes(self.irisLayer, keyPath: "transform.scale", values: [0.2, 1.35, 0.9, 1.0], keyTimes: [0.0, 0.45, 0.75, 1.0], duration: 0.5, delay: delay)
++    }
++}
+diff --git a/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreKeyframes.swift b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreKeyframes.swift
+new file mode 100644
+index 0000000000..710cd00c3a
+--- /dev/null
++++ b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreKeyframes.swift
+@@ -0,0 +1,16 @@
++import Foundation
++import UIKit
++import Display
++
++/// Keyframes that start after `delay` and hold their first value until then and their last one after.
++public func ignoreAddKeyframes(_ layer: CALayer, keyPath: String, values: [Any], keyTimes: [NSNumber], duration: Double, delay: Double, timing: CAMediaTimingFunctionName = .easeInEaseOut) {
++    let animation = CAKeyframeAnimation(keyPath: keyPath)
++    animation.values = values
++    animation.keyTimes = keyTimes
++    animation.duration = duration
++    animation.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil) + delay
++    animation.fillMode = .both
++    animation.isRemovedOnCompletion = false
++    animation.timingFunction = CAMediaTimingFunction(name: timing)
++    layer.add(animation, forKey: keyPath)
++}
+diff --git a/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreMenuItem.swift b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreMenuItem.swift
+new file mode 100644
+index 0000000000..1af5d3177b
+--- /dev/null
++++ b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoreMenuItem.swift
+@@ -0,0 +1,226 @@
++import Foundation
++import UIKit
++import AsyncDisplayKit
++import Display
++import ContextUI
++import TelegramPresentationData
++
++/// "Ignore Mark" in the menu of a message in a group, or "Stop Ignoring Mark". As the menu opens the row introduces
++/// itself: it lights up and stays larger for a couple of seconds, its eye blinks and is crossed out (or opens again),
++/// the title rises letter by letter, a ring goes out from the eye and a band of light passes over the row.
++public final class IgnoreMenuItem: ContextMenuCustomItem {
++    public enum Kind {
++        case ignore
++        case stopIgnoring
++    }
++
++    private static let introductionsKey = "IgnoreMenuItem.Introductions"
++    private static let introductionCount = 3
++
++    let kind: Kind
++    let title: String
++    let action: () -> Void
++
++    public init(kind: Kind, title: String, action: @escaping () -> Void) {
++        self.kind = kind
++        self.title = title
++        self.action = action
++    }
++
++    public func node(presentationData: PresentationData, getController: @escaping () -> ContextControllerProtocol?, actionSelected: @escaping (ContextMenuActionResult) -> Void) -> ContextMenuCustomNode {
++        // "Ignore" introduces itself the first times it is seen; "Stop Ignoring" whenever it is offered (it is offered
++        // only to someone who looks for it).
++        let introduces: Bool
++        switch self.kind {
++        case .ignore:
++            introduces = UserDefaults.standard.integer(forKey: IgnoreMenuItem.introductionsKey) < IgnoreMenuItem.introductionCount
++        case .stopIgnoring:
++            introduces = true
++        }
++        return IgnoreMenuItemNode(presentationData: presentationData, item: self, introduces: introduces, actionSelected: actionSelected)
++    }
++
++    fileprivate static func noteIntroduction() {
++        let count = UserDefaults.standard.integer(forKey: IgnoreMenuItem.introductionsKey)
++        UserDefaults.standard.set(count + 1, forKey: IgnoreMenuItem.introductionsKey)
++    }
++}
++
++private final class IgnoreMenuItemNode: ASDisplayNode, ContextMenuCustomNode {
++    private let item: IgnoreMenuItem
++    private let actionSelected: (ContextMenuActionResult) -> Void
++    private var presentationData: PresentationData
++    private let introduces: Bool
++    private var didIntroduce = false
++
++    private let highlightView = UIView()
++    private let tintView = UIView()
++    private let contentView = UIView()
++    private let eyeView: IgnoreEyeView
++    private let titleView = IgnoreTextView()
++
++    var needsSeparator: Bool {
++        return false
++    }
++
++    var needsPadding: Bool {
++        return true
++    }
++
++    init(presentationData: PresentationData, item: IgnoreMenuItem, introduces: Bool, actionSelected: @escaping (ContextMenuActionResult) -> Void) {
++        self.item = item
++        self.presentationData = presentationData
++        self.introduces = introduces && !UIAccessibility.isReduceMotionEnabled
++        self.actionSelected = actionSelected
++        // "Ignore" shows the eye that is about to be crossed out; "Stop Ignoring" the crossed out eye about to open.
++        self.eyeView = IgnoreEyeView(isSlashed: item.kind == .stopIgnoring)
++        super.init()
++
++        self.isAccessibilityElement = true
++        self.accessibilityLabel = item.title
++        self.accessibilityTraits = [.button]
++    }
++
++    override func didLoad() {
++        super.didLoad()
++        self.highlightView.isUserInteractionEnabled = false
++        self.highlightView.alpha = 0.0
++        self.view.addSubview(self.highlightView)
++        self.tintView.isUserInteractionEnabled = false
++        self.tintView.alpha = 0.0
++        self.view.addSubview(self.tintView)
++        self.contentView.isUserInteractionEnabled = false
++        self.view.addSubview(self.contentView)
++        self.contentView.addSubview(self.eyeView)
++        self.contentView.addSubview(self.titleView)
++        if self.introduces {
++            // The row comes in by itself as the menu settles: until then it is empty.
++            self.eyeView.alpha = 0.0
++            self.titleView.alpha = 0.0
++        }
++    }
++
++    override func didEnterHierarchy() {
++        super.didEnterHierarchy()
++        if self.introduces && !self.didIntroduce {
++            self.didIntroduce = true
++            if self.item.kind == .ignore {
++                IgnoreMenuItem.noteIntroduction()
++            }
++            DispatchQueue.main.asyncAfter(deadline: .now() + 0.14, execute: { [weak self] in
++                self?.playIntroduction()
++            })
++        }
++    }
++
++    private var titleFont: UIFont {
++        return Font.regular(self.presentationData.listsFontSize.baseDisplaySize)
++    }
++
++    func updateLayout(constrainedWidth: CGFloat, constrainedHeight: CGFloat) -> (CGSize, (CGSize, ContainedViewLayoutTransition) -> Void) {
++        let theme = self.presentationData.theme
++        let iconSideInset: CGFloat = 20.0
++        let titleX = iconSideInset + 40.0
++        let verticalInset: CGFloat = 11.0
++        let titleSize = IgnoreTextView.measure(text: NSAttributedString(string: self.item.title, attributes: [.font: self.titleFont]), width: max(1.0, constrainedWidth - titleX - 18.0), maxLines: 1)
++        let height = verticalInset * 2.0 + max(22.0, titleSize.height)
++        let minWidth = titleX + titleSize.width + 18.0
++
++        return (CGSize(width: minWidth, height: height), { [weak self] size, transition in
++            guard let self else {
++                return
++            }
++            let accent = theme.list.itemAccentColor
++            self.highlightView.frame = CGRect(origin: CGPoint(), size: size)
++            self.highlightView.backgroundColor = theme.contextMenu.itemHighlightedBackgroundColor
++            self.tintView.frame = CGRect(origin: CGPoint(), size: size)
++            self.tintView.backgroundColor = accent.withAlphaComponent(theme.overallDarkAppearance ? 0.24 : 0.13)
++            self.contentView.frame = CGRect(origin: CGPoint(), size: size)
++            let iconSize: CGFloat = 24.0
++            self.eyeView.frame = CGRect(x: iconSideInset + floor((32.0 - iconSize) * 0.5), y: floor((size.height - iconSize) * 0.5), width: iconSize, height: iconSize)
++            self.eyeView.color = theme.contextMenu.primaryColor
++            let titleWidth = max(1.0, min(titleSize.width, size.width - titleX - 18.0))
++            self.titleView.update(text: NSAttributedString(string: self.item.title, attributes: [.font: self.titleFont, .foregroundColor: theme.contextMenu.primaryColor]), width: titleWidth, maxLines: 1)
++            self.titleView.frame = CGRect(origin: CGPoint(x: titleX, y: floor((size.height - titleSize.height) * 0.5)), size: CGSize(width: titleWidth, height: titleSize.height))
++        })
++    }
++
++    /// The row lights up and grows, and stays larger for a couple of seconds while its eye blinks and is crossed out
++    /// (or opens again), its title rises letter by letter, a ring goes out from the eye and light passes over it.
++    private func playIntroduction() {
++        guard self.isNodeLoaded, !self.bounds.isEmpty else {
++            self.eyeView.alpha = 1.0
++            self.titleView.alpha = 1.0
++            return
++        }
++        self.eyeView.alpha = 1.0
++        self.titleView.alpha = 1.0
++        let accent = self.presentationData.theme.list.itemAccentColor
++
++        // The whole row lights up and grows a little, holds there for a couple of seconds, then settles.
++        let total = 2.6
++        ignoreAddKeyframes(self.tintView.layer, keyPath: "opacity", values: [0.0, 1.0, 1.0, 0.0], keyTimes: [0.0, 0.1, 0.78, 1.0], duration: total, delay: 0.0)
++        ignoreAddKeyframes(self.contentView.layer, keyPath: "transform.scale", values: [0.86, 1.2, 1.14, 1.17, 1.14, 1.0], keyTimes: [0.0, 0.12, 0.3, 0.52, 0.76, 1.0], duration: total, delay: 0.0)
++
++        // The eye pops in turning, then blinks and is crossed out (or opens again).
++        ignoreAddKeyframes(self.eyeView.layer, keyPath: "transform.scale", values: [0.1, 1.45, 0.88, 1.12, 1.0], keyTimes: [0.0, 0.35, 0.6, 0.8, 1.0], duration: 0.7, delay: 0.0)
++        ignoreAddKeyframes(self.eyeView.layer, keyPath: "transform.rotation.z", values: [-0.9, 0.25, -0.1, 0.0], keyTimes: [0.0, 0.4, 0.7, 1.0], duration: 0.7, delay: 0.0)
++        self.eyeView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.16)
++        switch self.item.kind {
++        case .ignore:
++            self.eyeView.blink(delay: 0.62, duration: 0.34)
++            self.eyeView.setSlashed(true, animated: true, delay: 0.98, duration: 0.42)
++        case .stopIgnoring:
++            self.eyeView.setSlashed(false, animated: true, delay: 0.62, duration: 0.42)
++            self.eyeView.popIris(delay: 0.9)
++        }
++        // A little nod of the eye as the slash lands (or comes off).
++        ignoreAddKeyframes(self.eyeView.layer, keyPath: "transform.translation.x", values: [0.0, -2.0, 1.5, 0.0], keyTimes: [0.0, 0.3, 0.65, 1.0], duration: 0.36, delay: 1.36)
++        self.sendRing(color: accent, delay: 1.3)
++
++        let _ = self.titleView.animateLettersIn(delay: 0.1, stagger: 0.024, offset: 10.0)
++        ignoreAnimateSheen(over: self.contentView, cornerRadius: 0.0, delay: 1.0, duration: 0.9, alpha: self.presentationData.theme.overallDarkAppearance ? 0.18 : 0.5)
++    }
++
++    /// A ring going out from the eye and fading.
++    private func sendRing(color: UIColor, delay: Double) {
++        let center = self.eyeView.center
++        let ring = CAShapeLayer()
++        ring.contentsScale = UIScreenScale * 2.0
++        ring.path = UIBezierPath(arcCenter: CGPoint(), radius: 15.0, startAngle: 0.0, endAngle: .pi * 2.0, clockwise: true).cgPath
++        ring.position = center
++        ring.fillColor = UIColor.clear.cgColor
++        ring.strokeColor = color.cgColor
++        ring.lineWidth = 2.0
++        ring.opacity = 0.0
++        self.contentView.layer.insertSublayer(ring, below: self.eyeView.layer)
++        ignoreAddKeyframes(ring, keyPath: "transform.scale", values: [0.6, 1.9], keyTimes: [0.0, 1.0], duration: 0.7, delay: delay, timing: .easeOut)
++        ignoreAddKeyframes(ring, keyPath: "opacity", values: [0.0, 0.7, 0.0], keyTimes: [0.0, 0.2, 1.0], duration: 0.7, delay: delay, timing: .easeOut)
++        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.8, execute: { [weak ring] in
++            ring?.removeFromSuperlayer()
++        })
++    }
++
++    func updateTheme(presentationData: PresentationData) {
++        self.presentationData = presentationData
++    }
++
++    func canBeHighlighted() -> Bool {
++        return true
++    }
++
++    func updateIsHighlighted(isHighlighted: Bool) {
++        if isHighlighted {
++            self.highlightView.alpha = 1.0
++        } else {
++            let previous = self.highlightView.alpha
++            self.highlightView.alpha = 0.0
++            self.highlightView.layer.animateAlpha(from: previous, to: 0.0, duration: 0.2)
++        }
++    }
++
++    func performAction() {
++        self.actionSelected(.dismissWithoutContent)
++        self.item.action()
++    }
++}
+diff --git a/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoredChatPanelComponent.swift b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoredChatPanelComponent.swift
+new file mode 100644
+index 0000000000..6b79fa342d
+--- /dev/null
++++ b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoredChatPanelComponent.swift
+@@ -0,0 +1,191 @@
++import Foundation
++import UIKit
++import Display
++import ComponentFlow
++import TelegramPresentationData
++
++/// The line under the header of a group where messages of someone ignored are hidden: who is ignored, and that a tap
++/// brings them back.
++public final class IgnoredChatPanelComponent: Component {
++    let theme: PresentationTheme
++    let strings: PresentationStrings
++    /// The names of the people whose messages are hidden here, the most recently ignored first.
++    let names: [String]
++    /// Whether it introduces itself as it appears (the first time it shows these people in a chat; not each time it
++    /// comes back, as after a search).
++    public let introduces: Bool
++    let action: (UIView) -> Void
++
++    public init(theme: PresentationTheme, strings: PresentationStrings, names: [String], introduces: Bool, action: @escaping (UIView) -> Void) {
++        self.theme = theme
++        self.strings = strings
++        self.names = names
++        self.introduces = introduces
++        self.action = action
++    }
++
++    public static func ==(lhs: IgnoredChatPanelComponent, rhs: IgnoredChatPanelComponent) -> Bool {
++        return lhs.theme === rhs.theme && lhs.strings === rhs.strings && lhs.names == rhs.names
++    }
++
++    public final class View: UIView {
++        private let contentView = UIView()
++        private let badgeView = UIView()
++        private let eyeView = IgnoreEyeView(isSlashed: true)
++        private let titleView = IgnoreTextView()
++        private let textView = IgnoreTextView()
++        private let arrowLayer = CAShapeLayer()
++        private var component: IgnoredChatPanelComponent?
++        private var didAppear = false
++
++        override init(frame: CGRect) {
++            super.init(frame: frame)
++            self.contentView.isUserInteractionEnabled = false
++            self.addSubview(self.contentView)
++            self.badgeView.addSubview(self.eyeView)
++            self.contentView.addSubview(self.badgeView)
++            self.contentView.addSubview(self.titleView)
++            self.contentView.addSubview(self.textView)
++            self.arrowLayer.fillColor = UIColor.clear.cgColor
++            self.arrowLayer.contentsScale = UIScreenScale * 2.0
++            self.arrowLayer.lineWidth = 2.0
++            self.arrowLayer.lineCap = .round
++            self.arrowLayer.lineJoin = .round
++            self.contentView.layer.addSublayer(self.arrowLayer)
++            self.isAccessibilityElement = true
++            self.accessibilityTraits = [.button]
++            self.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(self.tapped)))
++        }
++
++        required init?(coder: NSCoder) {
++            fatalError("init(coder:) has not been implemented")
++        }
++
++        @objc private func tapped() {
++            guard let component = self.component else {
++                return
++            }
++            if !UIAccessibility.isReduceMotionEnabled {
++                ignoreAnimatePop(self.contentView.layer, from: 0.96, overshoot: 1.02, duration: 0.3)
++            }
++            component.action(self)
++        }
++
++        private func texts(_ component: IgnoredChatPanelComponent) -> (title: String, text: String) {
++            let title: String
++            if component.names.count == 1, let name = component.names.first {
++                title = component.strings.IgnoredMembers_PanelTitle(name).string
++            } else {
++                title = component.strings.IgnoredMembers_PanelTitleMany("\(component.names.count)").string
++            }
++            return (title, component.strings.IgnoredMembers_PanelText)
++        }
++
++        func update(component: IgnoredChatPanelComponent, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++            self.component = component
++            let theme = component.theme
++            let (title, text) = self.texts(component)
++
++            let iconSize: CGFloat = 30.0
++            let leftInset: CGFloat = 12.0
++            let rightInset: CGFloat = 16.0
++            let arrowWidth: CGFloat = 7.0
++            let textX = leftInset + iconSize + 11.0
++            let textWidth = max(1.0, availableSize.width - textX - rightInset - arrowWidth - 10.0)
++            let titleColor = theme.rootController.navigationBar.primaryTextColor
++            let textColor = theme.rootController.navigationBar.secondaryTextColor
++            let titleSize = self.titleView.update(text: NSAttributedString(string: title, attributes: [.font: Font.semibold(15.0), .foregroundColor: titleColor]), width: textWidth, maxLines: 1)
++            let textSize = self.textView.update(text: NSAttributedString(string: text, attributes: [.font: Font.regular(13.0), .foregroundColor: textColor]), width: textWidth, maxLines: 1)
++
++            let verticalInset: CGFloat = 8.0
++            let height = max(iconSize + verticalInset * 2.0, verticalInset * 2.0 + titleSize.height + 1.0 + textSize.height)
++            let size = CGSize(width: availableSize.width, height: height)
++            self.contentView.frame = CGRect(origin: CGPoint(), size: size)
++
++            self.badgeView.frame = CGRect(x: leftInset, y: floor((height - iconSize) * 0.5), width: iconSize, height: iconSize)
++            self.badgeView.layer.cornerRadius = iconSize * 0.5
++            self.badgeView.backgroundColor = theme.list.itemAccentColor
++            self.eyeView.frame = self.badgeView.bounds.insetBy(dx: 6.0, dy: 6.0)
++            self.eyeView.color = .white
++            self.eyeView.lineWidth = 2.0
++
++            let blockHeight = titleSize.height + 1.0 + textSize.height
++            self.titleView.frame = CGRect(origin: CGPoint(x: textX, y: floor((height - blockHeight) * 0.5)), size: titleSize)
++            self.textView.frame = CGRect(origin: CGPoint(x: textX, y: self.titleView.frame.maxY + 1.0), size: textSize)
++
++            let arrow = UIBezierPath()
++            let arrowX = size.width - rightInset - arrowWidth
++            arrow.move(to: CGPoint(x: arrowX, y: height * 0.5 - 6.0))
++            arrow.addLine(to: CGPoint(x: arrowX + arrowWidth, y: height * 0.5))
++            arrow.addLine(to: CGPoint(x: arrowX, y: height * 0.5 + 6.0))
++            self.arrowLayer.path = arrow.cgPath
++            self.arrowLayer.strokeColor = textColor.withAlphaComponent(0.7).cgColor
++            self.arrowLayer.frame = CGRect(origin: CGPoint(), size: size)
++
++            self.accessibilityLabel = title
++            self.accessibilityHint = text
++
++            if !self.didAppear {
++                self.didAppear = true
++                if component.introduces {
++                    // Once the container has given the line its frame (the light passing over needs it).
++                    DispatchQueue.main.async { [weak self] in
++                        self?.animateAppearance()
++                    }
++                    UIAccessibility.post(notification: .announcement, argument: title)
++                }
++            }
++            return size
++        }
++
++        /// The line comes in large and stays so for a moment: the eye pops up turning and is crossed out, a ring goes
++        /// out of it, the title and the line under it come in letter by letter, light passes over, and it settles.
++        private func animateAppearance() {
++            guard !UIAccessibility.isReduceMotionEnabled, let component = self.component else {
++                return
++            }
++            // The line as a whole grows (with its glass) in the chat's node; inside it, a second ring later keeps the eye in
++            // view while the text comes in.
++            self.sendRing(color: component.theme.list.itemAccentColor, delay: 1.35)
++            let badge = self.badgeView.layer
++            ignoreAddKeyframes(badge, keyPath: "transform.scale", values: [0.0, 1.4, 0.88, 1.08, 1.0], keyTimes: [0.0, 0.35, 0.6, 0.8, 1.0], duration: 0.8, delay: 0.08)
++            ignoreAddKeyframes(badge, keyPath: "transform.rotation.z", values: [-1.0, 0.2, -0.06, 0.0], keyTimes: [0.0, 0.4, 0.7, 1.0], duration: 0.8, delay: 0.08)
++            // The eye is drawn open first and crossed out as it lands.
++            self.eyeView.setSlashed(false, animated: false)
++            self.eyeView.blink(delay: 0.45, duration: 0.26)
++            self.eyeView.setSlashed(true, animated: true, delay: 0.68, duration: 0.3)
++            self.sendRing(color: component.theme.list.itemAccentColor, delay: 0.62)
++            let titleDuration = self.titleView.animateLettersIn(delay: 0.2, stagger: 0.022, offset: 9.0)
++            let _ = self.textView.animateLettersIn(delay: min(titleDuration, 0.55), stagger: 0.012, offset: 6.0)
++            self.arrowLayer.animateAlpha(from: 0.0, to: 1.0, duration: 0.3, delay: 0.5)
++            ignoreAddKeyframes(self.arrowLayer, keyPath: "transform.translation.x", values: [-8.0, 2.0, 0.0], keyTimes: [0.0, 0.6, 1.0], duration: 0.45, delay: 0.5)
++            ignoreAnimateSheen(over: self, cornerRadius: self.bounds.height * 0.5, delay: 0.95, duration: 0.9, alpha: component.theme.overallDarkAppearance ? 0.16 : 0.45)
++        }
++
++        /// A ring going out from the eye and fading.
++        private func sendRing(color: UIColor, delay: Double) {
++            let ring = CAShapeLayer()
++            ring.contentsScale = UIScreenScale * 2.0
++            ring.path = UIBezierPath(arcCenter: CGPoint(), radius: self.badgeView.bounds.width * 0.5, startAngle: 0.0, endAngle: .pi * 2.0, clockwise: true).cgPath
++            ring.position = self.badgeView.center
++            ring.fillColor = UIColor.clear.cgColor
++            ring.strokeColor = color.cgColor
++            ring.lineWidth = 2.0
++            ring.opacity = 0.0
++            self.contentView.layer.insertSublayer(ring, below: self.badgeView.layer)
++            ignoreAddKeyframes(ring, keyPath: "transform.scale", values: [0.8, 1.9], keyTimes: [0.0, 1.0], duration: 0.65, delay: delay, timing: .easeOut)
++            ignoreAddKeyframes(ring, keyPath: "opacity", values: [0.0, 0.75, 0.0], keyTimes: [0.0, 0.2, 1.0], duration: 0.65, delay: delay, timing: .easeOut)
++            DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.75, execute: { [weak ring] in
++                ring?.removeFromSuperlayer()
++            })
++        }
++    }
++
++    public func makeView() -> View {
++        return View(frame: CGRect())
++    }
++
++    public func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++        return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
++    }
++}
+diff --git a/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoredMembers.swift b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoredMembers.swift
+new file mode 100644
+index 0000000000..f0da71066f
+--- /dev/null
++++ b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoredMembers.swift
+@@ -0,0 +1,103 @@
++import Foundation
++import SwiftSignalKit
++import TelegramCore
++
++/// The people an account ignores in groups: their messages are hidden for it in every group and in the comments of
++/// channels. Only this device knows (the people ignored are not told, nothing is sent anywhere). Safe from any thread.
++public final class IgnoredMembers {
++    public static let shared = IgnoredMembers()
++
++    private let lock = NSLock()
++    private var peerIds: [EnginePeer.Id: [EnginePeer.Id]] = [:]
++    private var promises: [EnginePeer.Id: ValuePromise<Set<EnginePeer.Id>>] = [:]
++
++    private static func key(accountPeerId: EnginePeer.Id) -> String {
++        return "IgnoredMembers.\(accountPeerId.toInt64())"
++    }
++
++    /// The ignored people of an account, the most recently ignored first. The caller holds the lock.
++    private func loadedPeerIds(accountPeerId: EnginePeer.Id) -> [EnginePeer.Id] {
++        if let current = self.peerIds[accountPeerId] {
++            return current
++        }
++        let stored = (UserDefaults.standard.array(forKey: IgnoredMembers.key(accountPeerId: accountPeerId)) as? [NSNumber]) ?? []
++        let loaded = stored.map { EnginePeer.Id($0.int64Value) }
++        self.peerIds[accountPeerId] = loaded
++        return loaded
++    }
++
++    /// The ignored people of an account, the most recently ignored first.
++    public func list(accountPeerId: EnginePeer.Id) -> [EnginePeer.Id] {
++        self.lock.lock()
++        defer {
++            self.lock.unlock()
++        }
++        return self.loadedPeerIds(accountPeerId: accountPeerId)
++    }
++
++    public func isIgnored(_ peerId: EnginePeer.Id, accountPeerId: EnginePeer.Id) -> Bool {
++        return self.list(accountPeerId: accountPeerId).contains(peerId)
++    }
++
++    /// The ignored people of an account, now and as they change.
++    public func signal(accountPeerId: EnginePeer.Id) -> Signal<Set<EnginePeer.Id>, NoError> {
++        self.lock.lock()
++        let promise: ValuePromise<Set<EnginePeer.Id>>
++        if let current = self.promises[accountPeerId] {
++            promise = current
++        } else {
++            promise = ValuePromise(Set(self.loadedPeerIds(accountPeerId: accountPeerId)), ignoreRepeated: true)
++            self.promises[accountPeerId] = promise
++        }
++        self.lock.unlock()
++        return promise.get()
++    }
++
++    /// Starts or stops ignoring `peerId` (never the account itself).
++    public func set(_ peerId: EnginePeer.Id, isIgnored: Bool, accountPeerId: EnginePeer.Id) {
++        guard peerId != accountPeerId else {
++            return
++        }
++        self.lock.lock()
++        var list = self.loadedPeerIds(accountPeerId: accountPeerId)
++        list.removeAll(where: { $0 == peerId })
++        if isIgnored {
++            list.insert(peerId, at: 0)
++        }
++        self.peerIds[accountPeerId] = list
++        UserDefaults.standard.set(list.map { NSNumber(value: $0.toInt64()) }, forKey: IgnoredMembers.key(accountPeerId: accountPeerId))
++        let promise = self.promises[accountPeerId]
++        self.lock.unlock()
++        promise?.set(Set(list))
++    }
++
++    /// Whether ignoring someone hides their messages in the chat `chatPeerId` (`channel`, if it is one): in groups and
++    /// in the comments of channels; never in a private chat, a channel's own posts or a channel's direct messages.
++    public static func applies(in chatPeerId: EnginePeer.Id, channel: TelegramChannel?) -> Bool {
++        if chatPeerId.namespace == Namespaces.Peer.CloudGroup {
++            return true
++        }
++        guard chatPeerId.namespace == Namespaces.Peer.CloudChannel else {
++            return false
++        }
++        if let channel {
++            if case .broadcast = channel.info {
++                return false
++            }
++            if channel.flags.contains(.isMonoforum) {
++                return false
++            }
++        }
++        return true
++    }
++
++    /// Whether `message` is hidden: its author (who posted it, also a forward) is ignored and it is in a chat where
++    /// ignoring applies. `chatChannel` is the chat, if it is a channel and known (else it is looked up in the message).
++    public static func hides(message: EngineRawMessage, chatChannel: TelegramChannel? = nil, ignored: Set<EnginePeer.Id>) -> Bool {
++        guard !ignored.isEmpty, let authorId = message.author?.id, authorId.namespace == Namespaces.Peer.CloudUser, ignored.contains(authorId) else {
++            return false
++        }
++        let chatPeerId = message.id.peerId
++        return IgnoredMembers.applies(in: chatPeerId, channel: chatChannel ?? (message.peers[chatPeerId] as? TelegramChannel))
++    }
++}
+diff --git a/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoredMembersController.swift b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoredMembersController.swift
+new file mode 100644
+index 0000000000..6c818a4be6
+--- /dev/null
++++ b/submodules/TelegramUI/Components/IgnoredMembers/Sources/IgnoredMembersController.swift
+@@ -0,0 +1,179 @@
++import Foundation
++import UIKit
++import Display
++import SwiftSignalKit
++import TelegramCore
++import TelegramPresentationData
++import TelegramUIPreferences
++import ItemListUI
++import PresentationDataUtils
++import AccountContext
++import ItemListPeerItem
++
++private final class IgnoredMembersControllerArguments {
++    let context: AccountContext
++    let setPeerIdWithRevealedOptions: (EnginePeer.Id?, EnginePeer.Id?) -> Void
++    let stopIgnoring: (EnginePeer.Id) -> Void
++    let openPeer: (EnginePeer) -> Void
++
++    init(context: AccountContext, setPeerIdWithRevealedOptions: @escaping (EnginePeer.Id?, EnginePeer.Id?) -> Void, stopIgnoring: @escaping (EnginePeer.Id) -> Void, openPeer: @escaping (EnginePeer) -> Void) {
++        self.context = context
++        self.setPeerIdWithRevealedOptions = setPeerIdWithRevealedOptions
++        self.stopIgnoring = stopIgnoring
++        self.openPeer = openPeer
++    }
++}
++
++private enum IgnoredMembersSection: Int32 {
++    case peers
++}
++
++private enum IgnoredMembersEntry: ItemListNodeEntry {
++    case peer(Int32, PresentationStrings, PresentationDateTimeFormat, PresentationPersonNameOrder, EnginePeer, ItemListPeerItemEditing)
++    case info(String)
++
++    var section: ItemListSectionId {
++        return IgnoredMembersSection.peers.rawValue
++    }
++
++    var stableId: AnyHashable {
++        switch self {
++        case let .peer(_, _, _, _, peer, _):
++            return AnyHashable(peer.id)
++        case .info:
++            return AnyHashable("info")
++        }
++    }
++
++    private var sortIndex: Int32 {
++        switch self {
++        case let .peer(index, _, _, _, _, _):
++            return index
++        case .info:
++            return Int32.max
++        }
++    }
++
++    static func ==(lhs: IgnoredMembersEntry, rhs: IgnoredMembersEntry) -> Bool {
++        switch lhs {
++        case let .peer(lhsIndex, lhsStrings, lhsFormat, lhsOrder, lhsPeer, lhsEditing):
++            if case let .peer(rhsIndex, rhsStrings, rhsFormat, rhsOrder, rhsPeer, rhsEditing) = rhs {
++                return lhsIndex == rhsIndex && lhsStrings === rhsStrings && lhsFormat == rhsFormat && lhsOrder == rhsOrder && lhsPeer == rhsPeer && lhsEditing == rhsEditing
++            }
++            return false
++        case let .info(text):
++            if case .info(text) = rhs {
++                return true
++            }
++            return false
++        }
++    }
++
++    static func <(lhs: IgnoredMembersEntry, rhs: IgnoredMembersEntry) -> Bool {
++        return lhs.sortIndex < rhs.sortIndex
++    }
++
++    func item(presentationData: ItemListPresentationData, arguments: Any) -> ListViewItem {
++        let arguments = arguments as! IgnoredMembersControllerArguments
++        switch self {
++        case let .peer(_, strings, dateTimeFormat, nameDisplayOrder, peer, editing):
++            let revealOptions = ItemListPeerItemRevealOptions(options: [ItemListPeerItemRevealOption(type: .accent, title: strings.IgnoredMembers_StopIgnoringShort, action: {
++                arguments.stopIgnoring(peer.id)
++            })])
++            return ItemListPeerItem(presentationData: presentationData, systemStyle: .glass, dateTimeFormat: dateTimeFormat, nameDisplayOrder: nameDisplayOrder, context: arguments.context, peer: peer, presence: nil, text: .none, label: .none, editing: editing, revealOptions: revealOptions, switchValue: nil, enabled: true, selectable: true, sectionId: self.section, action: {
++                arguments.openPeer(peer)
++            }, setPeerIdWithRevealedOptions: { previousId, id in
++                arguments.setPeerIdWithRevealedOptions(previousId, id)
++            }, removePeer: { peerId in
++                arguments.stopIgnoring(peerId)
++            })
++        case let .info(text):
++            return ItemListTextItem(presentationData: presentationData, text: .plain(text), sectionId: self.section)
++        }
++    }
++}
++
++private struct IgnoredMembersControllerState: Equatable {
++    var editing = false
++    var peerIdWithRevealedOptions: EnginePeer.Id?
++}
++
++/// Settings → Privacy and Security → Ignored in Groups: the people whose messages are hidden in groups, each of whom
++/// can be brought back.
++public func ignoredMembersController(context: AccountContext) -> ViewController {
++    let accountPeerId = context.account.peerId
++    let statePromise = ValuePromise(IgnoredMembersControllerState(), ignoreRepeated: true)
++    let stateValue = Atomic(value: IgnoredMembersControllerState())
++    let updateState: ((IgnoredMembersControllerState) -> IgnoredMembersControllerState) -> Void = { f in
++        statePromise.set(stateValue.modify { f($0) })
++    }
++    var pushControllerImpl: ((ViewController) -> Void)?
++
++    let arguments = IgnoredMembersControllerArguments(context: context, setPeerIdWithRevealedOptions: { peerId, fromPeerId in
++        updateState { state in
++            var state = state
++            if (peerId == nil && fromPeerId == state.peerIdWithRevealedOptions) || (peerId != nil && fromPeerId == nil) {
++                state.peerIdWithRevealedOptions = peerId
++            }
++            return state
++        }
++    }, stopIgnoring: { peerId in
++        IgnoredMembers.shared.set(peerId, isIgnored: false, accountPeerId: accountPeerId)
++    }, openPeer: { peer in
++        if let controller = context.sharedContext.makePeerInfoController(context: context, updatedPresentationData: nil, peer: peer, mode: .generic, avatarInitiallyExpanded: false, fromChat: false, requestsContext: nil) {
++            pushControllerImpl?(controller)
++        }
++    })
++
++    // The ignored people, in the order they were ignored (the most recent first).
++    let peers: Signal<[EnginePeer], NoError> = IgnoredMembers.shared.signal(accountPeerId: accountPeerId)
++    |> mapToSignal { _ -> Signal<[EnginePeer], NoError> in
++        let ids = IgnoredMembers.shared.list(accountPeerId: accountPeerId)
++        return context.engine.data.subscribe(EngineDataList(ids.map(TelegramEngine.EngineData.Item.Peer.Peer.init(id:))))
++        |> map { peers -> [EnginePeer] in
++            return peers.compactMap { $0 }
++        }
++    }
++
++    let signal = combineLatest(context.sharedContext.presentationData, statePromise.get(), peers)
++    |> deliverOnMainQueue
++    |> map { presentationData, state, peers -> (ItemListControllerState, (ItemListNodeState, Any)) in
++        var rightNavigationButton: ItemListNavigationButton?
++        if !peers.isEmpty {
++            if state.editing {
++                rightNavigationButton = ItemListNavigationButton(content: .icon(.done), style: .bold, enabled: true, staysInRow: true, action: {
++                    updateState { state in
++                        var state = state
++                        state.editing = false
++                        return state
++                    }
++                })
++            } else {
++                rightNavigationButton = ItemListNavigationButton(content: .text(presentationData.strings.Common_Edit), style: .regular, enabled: true, action: {
++                    updateState { state in
++                        var state = state
++                        state.editing = true
++                        return state
++                    }
++                })
++            }
++        }
++        var entries: [IgnoredMembersEntry] = []
++        for (index, peer) in peers.enumerated() {
++            entries.append(.peer(Int32(index), presentationData.strings, presentationData.dateTimeFormat, presentationData.nameDisplayOrder, peer, ItemListPeerItemEditing(editable: true, editing: state.editing, revealed: peer.id == state.peerIdWithRevealedOptions)))
++        }
++        if !peers.isEmpty {
++            entries.append(.info(presentationData.strings.IgnoredMembers_ListInfo))
++        }
++        let emptyStateItem: ItemListControllerEmptyStateItem? = peers.isEmpty ? ItemListTextEmptyStateItem(text: presentationData.strings.IgnoredMembers_ListEmpty) : nil
++        let controllerState = ItemListControllerState(presentationData: ItemListPresentationData(presentationData), title: .text(presentationData.strings.IgnoredMembers_ListTitle), leftNavigationButton: nil, rightNavigationButton: rightNavigationButton, backNavigationButton: ItemListBackButton(title: presentationData.strings.Common_Back), animateChanges: true)
++        let listState = ItemListNodeState(presentationData: ItemListPresentationData(presentationData), entries: entries, style: .blocks, emptyStateItem: emptyStateItem, animateChanges: true, scrollEnabled: emptyStateItem == nil)
++        return (controllerState, (listState, arguments))
++    }
++
++    let controller = ItemListController(context: context, state: signal)
++    pushControllerImpl = { [weak controller] c in
++        (controller?.navigationController as? NavigationController)?.pushViewController(c)
++    }
++    return controller
++}
+diff --git a/submodules/TelegramUI/Components/MediaManager/PeerMessagesMediaPlaylist/BUILD b/submodules/TelegramUI/Components/MediaManager/PeerMessagesMediaPlaylist/BUILD
+index 25de730ac0..46ef852616 100644
+--- a/submodules/TelegramUI/Components/MediaManager/PeerMessagesMediaPlaylist/BUILD
++++ b/submodules/TelegramUI/Components/MediaManager/PeerMessagesMediaPlaylist/BUILD
+@@ -10,6 +10,7 @@ swift_library(
+         "-warnings-as-errors",
+     ],
+     deps = [
++        "//submodules/TelegramUI/Components/IgnoredMembers",
+         "//submodules/Display",
+         "//submodules/ComponentFlow",
+         "//submodules/SSignalKit/SwiftSignalKit",
+diff --git a/submodules/TelegramUI/Components/MediaManager/PeerMessagesMediaPlaylist/Sources/PeerMessagesMediaPlaylist.swift b/submodules/TelegramUI/Components/MediaManager/PeerMessagesMediaPlaylist/Sources/PeerMessagesMediaPlaylist.swift
+index bea6e89f13..b3cc398ed1 100644
+--- a/submodules/TelegramUI/Components/MediaManager/PeerMessagesMediaPlaylist/Sources/PeerMessagesMediaPlaylist.swift
++++ b/submodules/TelegramUI/Components/MediaManager/PeerMessagesMediaPlaylist/Sources/PeerMessagesMediaPlaylist.swift
+@@ -7,6 +7,7 @@ import TelegramUIPreferences
+ import AccountContext
+ import MusicAlbumArtResources
+ import TextFormat
++import IgnoredMembers
+ 
+ private enum PeerMessagesMediaPlaylistLoadAnchor {
+     case messageId(EngineMessage.Id)
+@@ -181,10 +182,13 @@ private func aroundMessagesFromMessages(_ messages: [EngineRawMessage], centralI
+     return result
+ }
+ 
+-private func aroundMessagesFromView(view: EngineRawMessageHistoryView, centralIndex: EngineMessage.Index) -> [EngineRawMessage] {
++private func aroundMessagesFromView(view: EngineRawMessageHistoryView, centralIndex: EngineMessage.Index, ignored: Set<EnginePeer.Id> = Set()) -> [EngineRawMessage] {
+     let filteredEntries = view.entries.filter { entry in
+         if entry.message.minAutoremoveOrClearTimeout == viewOnceTimeout {
+             return false
++        } else if entry.index.id != centralIndex.id && IgnoredMembers.hides(message: entry.message, ignored: ignored) {
++            // Not the messages of people ignored in groups (they are not even prepared).
++            return false
+         } else {
+             return true
+         }
+@@ -248,12 +252,15 @@ private func navigatedMessageFromMessages(_ messages: [EngineRawMessage], anchor
+     }
+ }
+ 
+-private func navigatedMessageFromView(_ view: EngineRawMessageHistoryView, anchorIndex: EngineMessage.Index, position: NavigatedMessageFromViewPosition, reversed: Bool) -> (message: EngineRawMessage, around: [EngineRawMessage], exact: Bool)? {
++private func navigatedMessageFromView(_ view: EngineRawMessageHistoryView, anchorIndex: EngineMessage.Index, position: NavigatedMessageFromViewPosition, reversed: Bool, ignored: Set<EnginePeer.Id> = Set(), allowsHiddenAnchor: Bool = true) -> (message: EngineRawMessage, around: [EngineRawMessage], exact: Bool)? {
+     var index = 0
+     
+     let filteredEntries = view.entries.filter { entry in
+         if entry.message.minAutoremoveOrClearTimeout == viewOnceTimeout {
+             return false
++        } else if (entry.index.id != anchorIndex.id || !allowsHiddenAnchor) && IgnoredMembers.hides(message: entry.message, ignored: ignored) {
++            // Never on to a message of someone ignored in groups (it is hidden, and playing it would mark it as listened).
++            return false
+         } else {
+             return true
+         }
+@@ -265,23 +272,23 @@ private func navigatedMessageFromView(_ view: EngineRawMessageHistoryView, ancho
+             
+             switch position {
+                 case .exact:
+-                    return (entry.message, aroundMessagesFromView(view: view, centralIndex: entry.index), true)
++                    return (entry.message, aroundMessagesFromView(view: view, centralIndex: entry.index, ignored: ignored), true)
+                 case .later:
+                     if !reversed, let currentGroupKey {
+                         if index - 1 > 0, filteredEntries[index - 1].message.groupingKey == currentGroupKey {
+                             let message = filteredEntries[index - 1].message
+-                            return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[index - 1].index), true)
++                            return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[index - 1].index, ignored: ignored), true)
+                         } else {
+                             for i in index ..< filteredEntries.count {
+                                 if filteredEntries[i].message.groupingKey != currentGroupKey {
+                                     let message = filteredEntries[i].message
+-                                    return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i].index), true)
++                                    return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i].index, ignored: ignored), true)
+                                 }
+                             }
+                         }
+                     } else if index + 1 < filteredEntries.count {
+                         let message = filteredEntries[index + 1].message
+-                        return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[index + 1].index), true)
++                        return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[index + 1].index, ignored: ignored), true)
+                     } else {
+                         return nil
+                     }
+@@ -289,24 +296,24 @@ private func navigatedMessageFromView(_ view: EngineRawMessageHistoryView, ancho
+                     if !reversed, let currentGroupKey {
+                         if index + 1 < filteredEntries.count, filteredEntries[index + 1].message.groupingKey == currentGroupKey {
+                             let message = filteredEntries[index + 1].message
+-                            return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[index + 1].index), true)
++                            return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[index + 1].index, ignored: ignored), true)
+                         } else {
+                             var nextGroupingKey: Int64?
+                             for i in (0 ..< index).reversed() {
+                                 if let nextGroupingKey {
+                                     if filteredEntries[i].message.groupingKey != nextGroupingKey {
+                                         let message = filteredEntries[i + 1].message
+-                                        return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i + 1].index), true)
++                                        return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i + 1].index, ignored: ignored), true)
+                                     } else if i == 0 {
+                                         let message = filteredEntries[i].message
+-                                        return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i].index), true)
++                                        return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i].index, ignored: ignored), true)
+                                     }
+                                 } else if filteredEntries[i].message.groupingKey != currentGroupKey {
+                                     if let groupingKey = filteredEntries[i].message.groupingKey {
+                                         nextGroupingKey = groupingKey
+                                     } else {
+                                         let message = filteredEntries[i].message
+-                                        return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i].index), true)
++                                        return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i].index, ignored: ignored), true)
+                                     }
+                                 }
+                             }
+@@ -317,14 +324,14 @@ private func navigatedMessageFromView(_ view: EngineRawMessageHistoryView, ancho
+                             for i in (0 ..< index).reversed() {
+                                 if filteredEntries[i].message.groupingKey != nextGroupingKey {
+                                     let message = filteredEntries[i + 1].message
+-                                    return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i + 1].index), true)
++                                    return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i + 1].index, ignored: ignored), true)
+                                 } else if i == 0 {
+                                     let message = filteredEntries[i].message
+-                                    return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i].index), true)
++                                    return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[i].index, ignored: ignored), true)
+                                 }
+                             }
+                         }
+-                        return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[index - 1].index), true)
++                        return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[index - 1].index, ignored: ignored), true)
+                     } else {
+                         return nil
+                     }
+@@ -336,10 +343,10 @@ private func navigatedMessageFromView(_ view: EngineRawMessageHistoryView, ancho
+         switch position {
+             case .later, .exact:
+                 let message = filteredEntries[filteredEntries.count - 1].message
+-                return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[filteredEntries.count - 1].index), false)
++                return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[filteredEntries.count - 1].index, ignored: ignored), false)
+             case .earlier:
+                 let message = filteredEntries[0].message
+-                return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[0].index), false)
++                return (message, aroundMessagesFromView(view: view, centralIndex: filteredEntries[0].index, ignored: ignored), false)
+         }
+     } else {
+         return nil
+@@ -560,6 +567,9 @@ public final class PeerMessagesMediaPlaylist: SharedMediaPlaylist {
+     }
+     
+     private func loadItem(anchor: PeerMessagesMediaPlaylistLoadAnchor, navigation: PeerMessagesMediaPlaylistNavigation, reversed: Bool) {
++        let accountPeerId = self.context.account.peerId
++        // Wider while people are ignored in groups, to reach past runs of their messages.
++        let playlistWindowCount = IgnoredMembers.shared.list(accountPeerId: accountPeerId).isEmpty ? 10 : 80
+         self.loadingItem = true
+         self.updateState()
+         
+@@ -583,9 +593,9 @@ public final class PeerMessagesMediaPlaylist: SharedMediaPlaylist {
+                                 return .single(nil)
+                             }
+                             
+-                            return self.context.account.postbox.aroundMessageHistoryViewForLocation(self.context.chatLocationInput(for: chatLocation, contextHolder: self.chatLocationContextHolder ?? Atomic<ChatLocationContextHolder?>(value: nil)), anchor: .index(message.index), ignoreMessagesInTimestampRange: nil, ignoreMessageIds: Set(), count: 10, fixedCombinedReadStates: nil, topTaggedMessageIdNamespaces: [], tag: .tag(tagMask), appendMessagesFromTheSameGroup: false, namespaces: namespaces, orderStatistics: [])
++                            return self.context.account.postbox.aroundMessageHistoryViewForLocation(self.context.chatLocationInput(for: chatLocation, contextHolder: self.chatLocationContextHolder ?? Atomic<ChatLocationContextHolder?>(value: nil)), anchor: .index(message.index), ignoreMessagesInTimestampRange: nil, ignoreMessageIds: Set(), count: playlistWindowCount, fixedCombinedReadStates: nil, topTaggedMessageIdNamespaces: [], tag: .tag(tagMask), appendMessagesFromTheSameGroup: false, namespaces: namespaces, orderStatistics: [])
+                             |> mapToSignal { view -> Signal<(EngineRawMessage, [EngineRawMessage])?, NoError> in
+-                                if let (message, aroundMessages, _) = navigatedMessageFromView(view.0, anchorIndex: message.index, position: .exact, reversed: reversed) {
++                                if let (message, aroundMessages, _) = navigatedMessageFromView(view.0, anchorIndex: message.index, position: .exact, reversed: reversed, ignored: Set(IgnoredMembers.shared.list(accountPeerId: accountPeerId))) {
+                                     return .single((message, aroundMessages))
+                                 } else {
+                                     return .single((message, []))
+@@ -696,7 +706,7 @@ public final class PeerMessagesMediaPlaylist: SharedMediaPlaylist {
+                             guard let inputIndex = inputIndex else {
+                                 return .single(nil)
+                             }
+-                            return self.context.account.postbox.aroundMessageHistoryViewForLocation(self.context.chatLocationInput(for: chatLocation, contextHolder: self.chatLocationContextHolder ?? Atomic<ChatLocationContextHolder?>(value: nil)), anchor: .index(inputIndex), ignoreMessagesInTimestampRange: nil, ignoreMessageIds: Set(), count: 10, fixedCombinedReadStates: nil, topTaggedMessageIdNamespaces: [], tag: .tag(tagMask), appendMessagesFromTheSameGroup: false, namespaces: namespaces, orderStatistics: [])
++                            return self.context.account.postbox.aroundMessageHistoryViewForLocation(self.context.chatLocationInput(for: chatLocation, contextHolder: self.chatLocationContextHolder ?? Atomic<ChatLocationContextHolder?>(value: nil)), anchor: .index(inputIndex), ignoreMessagesInTimestampRange: nil, ignoreMessageIds: Set(), count: playlistWindowCount, fixedCombinedReadStates: nil, topTaggedMessageIdNamespaces: [], tag: .tag(tagMask), appendMessagesFromTheSameGroup: false, namespaces: namespaces, orderStatistics: [])
+                             |> mapToSignal { view -> Signal<(EngineRawMessage, [EngineRawMessage])?, NoError> in
+                                 let position: NavigatedMessageFromViewPosition
+                                 switch navigation {
+@@ -708,7 +718,13 @@ public final class PeerMessagesMediaPlaylist: SharedMediaPlaylist {
+                                         position = .exact
+                                 }
+                                 
+-                                if let (message, aroundMessages, exact) = navigatedMessageFromView(view.0, anchorIndex: inputIndex, position: position, reversed: reversed) {
++                                let isRandom: Bool
++                                if case .random = navigation {
++                                    isRandom = true
++                                } else {
++                                    isRandom = false
++                                }
++                                if let (message, aroundMessages, exact) = navigatedMessageFromView(view.0, anchorIndex: inputIndex, position: position, reversed: reversed, ignored: Set(IgnoredMembers.shared.list(accountPeerId: accountPeerId)), allowsHiddenAnchor: !isRandom) {
+                                     switch navigation {
+                                         case .random:
+                                             return .single((message, []))
+@@ -726,7 +742,7 @@ public final class PeerMessagesMediaPlaylist: SharedMediaPlaylist {
+                                     } else {
+                                         viewIndex = .lowerBound
+                                     }
+-                                    return self.context.account.postbox.aroundMessageHistoryViewForLocation(self.context.chatLocationInput(for: chatLocation, contextHolder: self.chatLocationContextHolder ?? Atomic<ChatLocationContextHolder?>(value: nil)), anchor: viewIndex, ignoreMessagesInTimestampRange: nil, ignoreMessageIds: Set(), count: 10, fixedCombinedReadStates: nil, topTaggedMessageIdNamespaces: [], tag: .tag(tagMask), appendMessagesFromTheSameGroup: false, namespaces: namespaces, orderStatistics: [])
++                                    return self.context.account.postbox.aroundMessageHistoryViewForLocation(self.context.chatLocationInput(for: chatLocation, contextHolder: self.chatLocationContextHolder ?? Atomic<ChatLocationContextHolder?>(value: nil)), anchor: viewIndex, ignoreMessagesInTimestampRange: nil, ignoreMessageIds: Set(), count: playlistWindowCount, fixedCombinedReadStates: nil, topTaggedMessageIdNamespaces: [], tag: .tag(tagMask), appendMessagesFromTheSameGroup: false, namespaces: namespaces, orderStatistics: [])
+                                     |> mapToSignal { view -> Signal<(EngineRawMessage, [EngineRawMessage])?, NoError> in
+                                         let position: NavigatedMessageFromViewPosition
+                                         switch navigation {
+@@ -735,7 +751,7 @@ public final class PeerMessagesMediaPlaylist: SharedMediaPlaylist {
+                                             case .earlier:
+                                                 position = .later
+                                         }
+-                                        if let (message, aroundMessages, _) = navigatedMessageFromView(view.0, anchorIndex: EngineMessage.Index.absoluteLowerBound(), position: position, reversed: reversed) {
++                                        if let (message, aroundMessages, _) = navigatedMessageFromView(view.0, anchorIndex: EngineMessage.Index.absoluteLowerBound(), position: position, reversed: reversed, ignored: Set(IgnoredMembers.shared.list(accountPeerId: accountPeerId))) {
+                                             return .single((message, aroundMessages))
+                                         } else {
+                                             return .single(nil)
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD
+index 0ca07f27e2..fcc265650b 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD
+@@ -12,6 +12,7 @@ swift_library(
+     deps = [
+         "//submodules/UrlWhitelist",
+         "//submodules/TelegramUI/Components/NavigationBarNode",
++        "//submodules/TelegramUI/Components/IgnoredMembers",
+         "//submodules/TelegramUI/Components/NavigationBarComponent",
+         "//submodules/TelegramUI/Components/NavigationExpansionTransition",
+         "//submodules/AccountContext",
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenPerformButtonAction.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenPerformButtonAction.swift
+index 632935729e..29f65b5b35 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenPerformButtonAction.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenPerformButtonAction.swift
+@@ -14,6 +14,7 @@ import TelegramNotices
+ import AlertComponent
+ import WalletContext
+ import WalletSendScreen
++import IgnoredMembers
+ 
+ extension PeerInfoScreenNode {
+     func performButtonAction(key: PeerInfoHeaderButtonKey, buttonNode: PeerInfoHeaderButtonNode?, gesture: ContextGesture?) {
+@@ -882,6 +883,28 @@ extension PeerInfoScreenNode {
+                         })))
+                     }
+                     
++                    // Ignore the person in groups (their messages are hidden for the account in every group), or stop.
++                    if strongSelf.peerId.namespace == Namespaces.Peer.CloudUser && user.botInfo == nil && user.id != strongSelf.context.account.peerId {
++                        let accountPeerId = strongSelf.context.account.peerId
++                        let isIgnored = IgnoredMembers.shared.isIgnored(user.id, accountPeerId: accountPeerId)
++                        let title = isIgnored ? presentationData.strings.IgnoredMembers_StopIgnoring(EnginePeer(user).compactDisplayTitle).string : presentationData.strings.IgnoredMembers_ProfileIgnore
++                        items.append(.custom(IgnoreMenuItem(kind: isIgnored ? .stopIgnoring : .ignore, title: title, action: { [weak self] in
++                            IgnoredMembers.shared.set(user.id, isIgnored: !isIgnored, accountPeerId: accountPeerId)
++                            guard let self, let controller = self.controller else {
++                                return
++                            }
++                            let strings = self.presentationData.strings
++                            if !isIgnored {
++                                controller.present(UndoOverlayController(presentationData: self.presentationData, content: .actionSucceeded(title: strings.IgnoredMembers_ToastIgnoredTitle(EnginePeer(user).compactDisplayTitle).string, text: strings.IgnoredMembers_ToastIgnoredText, cancel: strings.Undo_Undo, destructive: false), elevatedLayout: false, action: { action in
++                                    if case .undo = action {
++                                        IgnoredMembers.shared.set(user.id, isIgnored: false, accountPeerId: accountPeerId)
++                                    }
++                                    return false
++                                }), in: .current)
++                            }
++                        }), false))
++                    }
++                    
+                     if strongSelf.peerId.namespace == Namespaces.Peer.CloudUser && user.botInfo == nil && !user.flags.contains(.isSupport) {
+                         if data.isContact {
+                             if let cachedData = data.cachedData as? CachedUserData, cachedData.isBlocked {
+diff --git a/submodules/TelegramUI/Sources/ApplicationContext.swift b/submodules/TelegramUI/Sources/ApplicationContext.swift
+index fe34b99844..e8191701f4 100644
+--- a/submodules/TelegramUI/Sources/ApplicationContext.swift
++++ b/submodules/TelegramUI/Sources/ApplicationContext.swift
+@@ -33,6 +33,7 @@ import AttachmentUI
+ import MinimizedContainer
+ import BrowserUI
+ import NewsFeedSupport
++import IgnoredMembers
+ 
+ final class UnauthorizedApplicationContext {
+     let sharedContext: SharedAccountContextImpl
+@@ -306,10 +307,15 @@ final class AuthorizedApplicationContext {
+                 }
+             ))
+             |> map { chatListIndexMap in
++                let ignored = Set(IgnoredMembers.shared.list(accountPeerId: context.account.peerId))
+                 return messageList.filter { item in
+                     guard let message = item.0.first else {
+                         return false
+                     }
++                    // Not from someone ignored in groups, in a group.
++                    if IgnoredMembers.hides(message: message, ignored: ignored) {
++                        return false
++                    }
+                     if let maybeChatListIndex = chatListIndexMap[message.id.peerId], maybeChatListIndex != nil {
+                         return true
+                     } else {
+diff --git a/submodules/TelegramUI/Sources/Chat/ChatControllerIgnoredMembers.swift b/submodules/TelegramUI/Sources/Chat/ChatControllerIgnoredMembers.swift
+new file mode 100644
+index 0000000000..ba6886c492
+--- /dev/null
++++ b/submodules/TelegramUI/Sources/Chat/ChatControllerIgnoredMembers.swift
+@@ -0,0 +1,352 @@
++import Foundation
++import UIKit
++import Display
++import AsyncDisplayKit
++import SwiftSignalKit
++import TelegramCore
++import AccountContext
++import ChatPresentationInterfaceState
++import ContextUI
++import UndoUI
++import ChatMessageItemView
++import ChatMessageItemImpl
++import IgnoredMembers
++
++/// What a group chat knows of the people ignored in groups: whose messages are hidden here (for the line under the
++/// header), and whose messages are coming back.
++final class ChatControllerIgnoredMembersState {
++    var hiddenPeersDisposable: Disposable?
++    /// The history node the line follows (the chat's node can change it).
++    weak var subscribedHistoryNode: ChatHistoryListNodeImpl?
++    /// The people whose messages are hidden here, the most recently ignored first. Once someone is in the line they
++    /// stay there while the chat is open (also when their messages scroll out of the loaded part), until they are
++    /// brought back.
++    var hiddenPeers: [EnginePeer] = []
++    let shownPeerIds = Atomic<Set<EnginePeer.Id>>(value: Set())
++    /// Those the line has introduced itself for (it does so once, not each time it comes back after a search).
++    var introducedPeerIds = Set<EnginePeer.Id>()
++    /// The messages that are coming back (of someone no longer ignored), until they have appeared.
++    var revealingMessageIds = Set<EngineMessage.Id>()
++    var revealingAuthorId: EnginePeer.Id?
++    var revealingUntil: Double = 0.0
++    /// Where the effects are drawn: over the messages, under everything else.
++    var overlayView: UIView?
++
++    deinit {
++        self.hiddenPeersDisposable?.dispose()
++    }
++}
++
++extension ChatControllerImpl {
++    private var ignoreEffectStyle: IgnoreEffectStyle {
++        return IgnoreEffectStyle(badgeColor: self.presentationData.theme.list.itemAccentColor, glyphColor: .white)
++    }
++
++    /// The view the effects are drawn in, just over the messages.
++    private func ignoreOverlayView() -> UIView? {
++        guard self.isNodeLoaded else {
++            return nil
++        }
++        let historyView = self.chatDisplayNode.historyNode.view
++        guard let superview = historyView.superview else {
++            return nil
++        }
++        let state = self.ignoredMembersState
++        if let overlay = state.overlayView, overlay.superview === superview {
++            overlay.frame = superview.bounds
++            return overlay
++        }
++        state.overlayView?.removeFromSuperview()
++        let overlay = UIView(frame: superview.bounds)
++        overlay.isUserInteractionEnabled = false
++        overlay.clipsToBounds = true
++        superview.insertSubview(overlay, aboveSubview: historyView)
++        state.overlayView = overlay
++        return overlay
++    }
++
++    // MARK: - Ignoring
++
++    /// Starts ignoring `peer` from the menu of their message `sourceMessageId`: once the menu has gone, their messages
++    /// on screen are drawn into eyes that close, one after another out from that message, and then leave the chat.
++    func ignoreAuthor(_ peer: EnginePeer, sourceMessageId: EngineMessage.Id) {
++        let accountPeerId = self.context.account.peerId
++        Queue.mainQueue().after(0.3, { [weak self] in
++            guard let self else {
++                // The chat was closed meanwhile: they are ignored all the same.
++                IgnoredMembers.shared.set(peer.id, isIgnored: true, accountPeerId: accountPeerId)
++                return
++            }
++            self.playIgnore(peer, sourceMessageId: sourceMessageId)
++        })
++    }
++
++    private func playIgnore(_ peer: EnginePeer, sourceMessageId: EngineMessage.Id) {
++        let accountPeerId = self.context.account.peerId
++        guard let overlay = self.ignoreOverlayView() else {
++            IgnoredMembers.shared.set(peer.id, isIgnored: true, accountPeerId: accountPeerId)
++            return
++        }
++        let historyNode = self.chatDisplayNode.historyNode
++
++        // Their messages on screen (the parts of them on screen), and their avatars; the rest are hidden at once (as
++        // the list closes up they would come into view while they go).
++        var parts: [(node: ChatMessageItemView, snapshot: IgnoreSnapshot, frame: CGRect, isSource: Bool)] = []
++        var hiddenNodes: [ASDisplayNode] = []
++        historyNode.forEachItemNode { node in
++            guard let itemNode = node as? ChatMessageItemView, let item = itemNode.item, item.message.author?.id == peer.id else {
++                return
++            }
++            hiddenNodes.append(itemNode)
++            let visibleRect = overlay.convert(overlay.bounds, to: itemNode.view).intersection(itemNode.view.bounds)
++            if itemNode.view.window != nil, !visibleRect.isEmpty, let snapshot = IgnoreSnapshot.take(of: itemNode.view, in: visibleRect) {
++                let frame = itemNode.view.convert(snapshot.rect, to: overlay)
++                let isSource = item.content.contains(where: { $0.0.id == sourceMessageId })
++                parts.append((itemNode, snapshot, frame, isSource))
++            }
++        }
++        var avatars: [(snapshot: IgnoreSnapshot, frame: CGRect)] = []
++        historyNode.forEachItemHeaderNode { headerNode in
++            guard let avatarNode = headerNode as? ChatMessageAvatarHeaderNodeImpl, avatarNode.avatarPeerId == peer.id else {
++                return
++            }
++            hiddenNodes.append(avatarNode)
++            let frame = avatarNode.view.convert(avatarNode.view.bounds, to: overlay)
++            if frame.intersects(overlay.bounds), let snapshot = IgnoreSnapshot.take(of: avatarNode.view) {
++                avatars.append((snapshot, frame))
++            }
++        }
++        // Hidden, not made transparent: the list sets the opacity of its nodes as it moves them.
++        for node in hiddenNodes {
++            node.isHidden = true
++        }
++
++        // Out from the message the menu was opened on, nearest first.
++        let sourceY = parts.first(where: { $0.isSource })?.frame.midY ?? overlay.bounds.midY
++        let ordered = parts.sorted(by: { abs($0.frame.midY - sourceY) < abs($1.frame.midY - sourceY) })
++        let step = 0.085
++        // Each avatar goes with the message of theirs nearest to it.
++        var extras: [Int: [(snapshot: IgnoreSnapshot, frame: CGRect)]] = [:]
++        for avatar in avatars {
++            if let index = ordered.indices.min(by: { abs(ordered[$0].frame.maxY - avatar.frame.maxY) < abs(ordered[$1].frame.maxY - avatar.frame.maxY) }) {
++                extras[index, default: []].append(avatar)
++            }
++        }
++        for (index, part) in ordered.enumerated() {
++            ignorePlayDissolve(snapshot: part.snapshot, frame: part.frame, extra: extras[index] ?? [], in: overlay, style: self.ignoreEffectStyle, delay: Double(index) * step)
++        }
++        if !ordered.isEmpty {
++            HapticFeedback().impact(.light)
++        }
++
++        // Once the last of them has gone into its eye, they leave the chat for good.
++        let leaveAfter = ordered.isEmpty ? 0.0 : Double(ordered.count - 1) * step + 0.8
++        Queue.mainQueue().after(leaveAfter, { [weak self] in
++            IgnoredMembers.shared.set(peer.id, isIgnored: true, accountPeerId: accountPeerId)
++            // By now their nodes have left the list; any still in it show again (they are no longer ignored, after Undo,
++            // or their message is one that stays).
++            Queue.mainQueue().after(1.0, {
++                let ignored = Set(IgnoredMembers.shared.list(accountPeerId: accountPeerId))
++                for node in hiddenNodes where node.supernode != nil {
++                    if let itemNode = node as? ChatMessageItemView, let message = itemNode.item?.message, IgnoredMembers.hides(message: message, ignored: ignored) {
++                        continue
++                    }
++                    node.isHidden = false
++                }
++            })
++            guard let self else {
++                return
++            }
++            let strings = self.presentationData.strings
++            self.present(UndoOverlayController(presentationData: self.presentationData, content: .actionSucceeded(title: strings.IgnoredMembers_ToastIgnoredTitle(peer.compactDisplayTitle).string, text: strings.IgnoredMembers_ToastIgnoredText, cancel: strings.Undo_Undo, destructive: false), elevatedLayout: false, action: { [weak self] action in
++                if case .undo = action {
++                    self?.stopIgnoring(peer)
++                }
++                return false
++            }), in: .current)
++        })
++    }
++
++    // MARK: - Bringing back
++
++    /// Stops ignoring `peer`: their messages come back, each out of an eye that opens.
++    func stopIgnoring(_ peer: EnginePeer) {
++        let state = self.ignoredMembersState
++        if self.isNodeLoaded {
++            // Only these messages come in with the effect, as they appear.
++            state.revealingMessageIds = self.chatDisplayNode.historyNode.loadedMessageIds(authorId: peer.id)
++            state.revealingAuthorId = peer.id
++            state.revealingUntil = CACurrentMediaTime() + 1.5
++        }
++        IgnoredMembers.shared.set(peer.id, isIgnored: false, accountPeerId: self.context.account.peerId)
++    }
++
++    /// An update of the history is in place (its nodes are not yet on screen): the messages coming back that it shows
++    /// come in with the effect.
++    func ignoredMembersHistoryTransitionApplied() {
++        let state = self.ignoredMembersState
++        guard !state.revealingMessageIds.isEmpty, let authorId = state.revealingAuthorId else {
++            return
++        }
++        guard CACurrentMediaTime() < state.revealingUntil, let overlay = self.ignoreOverlayView() else {
++            state.revealingMessageIds.removeAll()
++            state.revealingAuthorId = nil
++            return
++        }
++        let historyNode = self.chatDisplayNode.historyNode
++        var nodes: [ChatMessageItemView] = []
++        historyNode.forEachVisibleMessageItemNode { itemNode in
++            guard let item = itemNode.item, item.content.contains(where: { state.revealingMessageIds.contains($0.0.id) }) else {
++                return
++            }
++            let frame = itemNode.view.convert(itemNode.view.bounds, to: overlay)
++            if frame.intersects(overlay.bounds) {
++                nodes.append(itemNode)
++            }
++        }
++        guard !nodes.isEmpty else {
++            // Not in this update.
++            return
++        }
++        // Each comes in once.
++        state.revealingMessageIds.removeAll()
++        state.revealingAuthorId = nil
++        for node in nodes {
++            node.isHidden = true
++        }
++        var avatarNodes: [ASDisplayNode] = []
++        historyNode.forEachItemHeaderNode { headerNode in
++            if let avatarNode = headerNode as? ChatMessageAvatarHeaderNodeImpl, avatarNode.avatarPeerId == authorId {
++                avatarNode.isHidden = true
++                avatarNodes.append(avatarNode)
++            }
++        }
++        let style = self.ignoreEffectStyle
++        // Once they have been laid out (they are drawn for the effect before they are shown), top to bottom.
++        Queue.mainQueue().after(0.12, { [weak overlay] in
++            guard let overlay else {
++                for node in nodes {
++                    node.isHidden = false
++                }
++                for node in avatarNodes {
++                    node.isHidden = false
++                }
++                return
++            }
++            let ordered = nodes.sorted(by: { $0.view.convert($0.view.bounds, to: overlay).minY < $1.view.convert($1.view.bounds, to: overlay).minY })
++            for (index, node) in ordered.enumerated() {
++                let visibleRect = overlay.convert(overlay.bounds, to: node.view).intersection(node.view.bounds)
++                guard node.view.window != nil, !visibleRect.isEmpty, let snapshot = IgnoreSnapshot.take(of: node.view, in: visibleRect, renderLayer: true) else {
++                    node.isHidden = false
++                    continue
++                }
++                ignorePlayReassemble(node: node, snapshot: snapshot, in: overlay, style: style, delay: Double(index) * 0.085)
++            }
++            if !ordered.isEmpty {
++                HapticFeedback().impact(.light)
++            }
++            // The avatars come back with their messages, popping in.
++            for node in avatarNodes {
++                node.isHidden = false
++                if !UIAccessibility.isReduceMotionEnabled {
++                    node.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.3, delay: 0.55)
++                    node.layer.animateSpring(from: 0.3 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.6, delay: 0.55, damping: 60.0)
++                }
++            }
++        })
++    }
++
++    // MARK: - The line under the header
++
++    /// The line for `interfaceState`, set on the chat's node. Returns whether it appeared, went or changed.
++    func updateIgnoredMembersPanel(interfaceState: ChatPresentationInterfaceState) -> Bool {
++        let state = self.ignoredMembersState
++        if self.isNodeLoaded, state.subscribedHistoryNode !== self.chatDisplayNode.historyNode {
++            let context = self.context
++            let accountPeerId = context.account.peerId
++            let historyNode = self.chatDisplayNode.historyNode
++            state.subscribedHistoryNode = historyNode
++            state.hiddenPeersDisposable?.dispose()
++            historyNode.historyTransitionApplied = { [weak self] in
++                self?.ignoredMembersHistoryTransitionApplied()
++            }
++            let shownPeerIds = state.shownPeerIds
++            state.hiddenPeersDisposable = (combineLatest(historyNode.ignoredHiddenAuthors, IgnoredMembers.shared.signal(accountPeerId: accountPeerId))
++            |> map { counts, ignored -> [EnginePeer.Id] in
++                // Those whose messages are hidden here, and those already in the line while they are still ignored; in
++                // the order they were ignored, the most recent first.
++                let shown = shownPeerIds.modify { current in
++                    return current.filter { ignored.contains($0) }.union(counts.keys.filter { ignored.contains($0) })
++                }
++                return IgnoredMembers.shared.list(accountPeerId: accountPeerId).filter { shown.contains($0) }
++            }
++            |> distinctUntilChanged
++            |> mapToSignal { ids -> Signal<[EnginePeer], NoError> in
++                return context.engine.data.get(EngineDataList(ids.map(TelegramEngine.EngineData.Item.Peer.Peer.init(id:))))
++                |> map { peers -> [EnginePeer] in
++                    return peers.compactMap { $0 }
++                }
++            }
++            |> deliverOnMainQueue).startStrict(next: { [weak self] peers in
++                guard let self else {
++                    return
++                }
++                self.ignoredMembersState.hiddenPeers = peers
++                self.updateChatPresentationInterfaceState(animated: true, interactive: false, { $0 })
++            })
++        }
++
++        var panel: IgnoredChatPanelComponent?
++        if !state.hiddenPeers.isEmpty, interfaceState.search == nil, interfaceState.interfaceState.selectionState == nil {
++            // It introduces itself for people it has not shown yet in this chat.
++            let peerIds = Set(state.hiddenPeers.map(\.id))
++            let introduces = !peerIds.isSubset(of: state.introducedPeerIds)
++            panel = IgnoredChatPanelComponent(
++                theme: interfaceState.theme,
++                strings: interfaceState.strings,
++                names: state.hiddenPeers.map { $0.compactDisplayTitle },
++                introduces: introduces,
++                action: { [weak self] view in
++                    self?.presentIgnoredMembersMenu(sourceView: view)
++                }
++            )
++        }
++        guard self.chatDisplayNode.ignoredMembersPanel != panel else {
++            return false
++        }
++        if let panel, panel.introduces {
++            state.introducedPeerIds.formUnion(state.hiddenPeers.map(\.id))
++        }
++        self.chatDisplayNode.ignoredMembersPanel = panel
++        return true
++    }
++
++    /// The menu of the line under the header: bring back each of the people hidden here, or see all who are ignored.
++    private func presentIgnoredMembersMenu(sourceView: UIView) {
++        let strings = self.presentationData.strings
++        var items: [ContextMenuItem] = []
++        for peer in self.ignoredMembersState.hiddenPeers {
++            items.append(.custom(IgnoreMenuItem(kind: .stopIgnoring, title: strings.IgnoredMembers_StopIgnoring(peer.compactDisplayTitle).string, action: { [weak self] in
++                self?.stopIgnoring(peer)
++            }), false))
++        }
++        items.append(.separator)
++        items.append(.action(ContextMenuActionItem(text: strings.IgnoredMembers_ListTitle, icon: { theme in
++            return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Eye"), color: theme.contextMenu.primaryColor)
++        }, action: { [weak self] _, f in
++            f(.dismissWithoutContent)
++            guard let self else {
++                return
++            }
++            self.effectiveNavigationController?.pushViewController(ignoredMembersController(context: self.context))
++        })))
++        let contextController = makeContextController(
++            presentationData: self.presentationData,
++            source: .reference(ChatControllerContextReferenceContentSource(controller: self, sourceView: sourceView, insets: .zero, actionsOnTop: false)),
++            items: .single(ContextController.Items(content: .list(items))),
++            gesture: nil
++        )
++        self.chatDisplayNode.dismissInput()
++        self.presentInGlobalOverlay(contextController)
++    }
++}
+diff --git a/submodules/TelegramUI/Sources/Chat/UpdateChatPresentationInterfaceState.swift b/submodules/TelegramUI/Sources/Chat/UpdateChatPresentationInterfaceState.swift
+index face5ae793..de4ef4cd02 100644
+--- a/submodules/TelegramUI/Sources/Chat/UpdateChatPresentationInterfaceState.swift
++++ b/submodules/TelegramUI/Sources/Chat/UpdateChatPresentationInterfaceState.swift
+@@ -529,6 +529,9 @@ func updateChatPresentationInterfaceStateImpl(
+     }
+     
+     if selfController.isNodeLoaded {
++        if selfController.updateIgnoredMembersPanel(interfaceState: updatedChatPresentationInterfaceState) {
++            forceLayout = true
++        }
+         selfController.chatDisplayNode.updateChatPresentationInterfaceState(updatedChatPresentationInterfaceState, transition: transition, interactive: interactive, forceLayout: forceLayout, completion: completion)
+     } else {
+         completion(.immediate)
+diff --git a/submodules/TelegramUI/Sources/ChatController.swift b/submodules/TelegramUI/Sources/ChatController.swift
+index 5fe58bbf51..523f970d83 100644
+--- a/submodules/TelegramUI/Sources/ChatController.swift
++++ b/submodules/TelegramUI/Sources/ChatController.swift
+@@ -265,6 +265,8 @@ public final class ChatControllerImpl: TelegramBaseController, ChatController, G
+     
+     var pendingContentData: (contentData: ChatControllerImpl.ContentData, historyNode: ChatHistoryListNodeImpl)?
+     var contentData: ChatControllerImpl.ContentData?
++    /// People ignored in groups: whose messages are hidden here, and the line under the header.
++    let ignoredMembersState = ChatControllerIgnoredMembersState()
+     let contentDataReady = ValuePromise<Bool>(false, ignoreRepeated: true)
+     var contentDataDisposable: Disposable?
+     var newTopicEventsDisposable: Disposable?
+diff --git a/submodules/TelegramUI/Sources/ChatControllerNode.swift b/submodules/TelegramUI/Sources/ChatControllerNode.swift
+index ee5838449d..d5c37e01a4 100644
+--- a/submodules/TelegramUI/Sources/ChatControllerNode.swift
++++ b/submodules/TelegramUI/Sources/ChatControllerNode.swift
+@@ -76,6 +76,7 @@ import RichTextEditorUIKit
+ import RichTextEditorMediaView
+ import InstantPageUI
+ import ChatRichTextEditorComposer
++import IgnoredMembers
+ 
+ final class VideoNavigationControllerDropContentItem: NavigationControllerDropContentItem {
+     let itemNode: OverlayMediaItemNode
+@@ -280,6 +281,8 @@ class ChatControllerNode: ASDisplayNode, ASScrollViewDelegate {
+     private var floatingTopicsPanel: (view: ComponentView<ChatSidePanelEnvironment>, component: ChatFloatingTopicsPanel)?
+     private var headerPanelsView: ComponentView<Empty>?
+     private var footerPanelsView: ComponentView<Empty>?
++    /// The line under the header of a group where messages of someone ignored are hidden.
++    var ignoredMembersPanel: IgnoredChatPanelComponent?
+     
+     private var topBackgroundEdgeEffectNode: WallpaperEdgeEffectNode?
+     private var bottomBackgroundEdgeEffectNode: WallpaperEdgeEffectNode?
+@@ -1465,6 +1468,14 @@ class ChatControllerNode: ASDisplayNode, ASScrollViewDelegate {
+         var footerPanels: [HeaderPanelContainerComponent.Panel] = []
+         let hideTopPanels = self.controller?.hideTopPanels ?? false
+         
++        if !hideTopPanels, let ignoredMembersPanel = self.ignoredMembersPanel, self.chatPresentationInterfaceState.search == nil {
++            headerPanels.append(HeaderPanelContainerComponent.Panel(
++                key: "ignoredMembers",
++                orderIndex: 5,
++                component: AnyComponent(ignoredMembersPanel)
++            ))
++        }
++        
+         if !hideTopPanels, self.chatPresentationInterfaceState.search == nil, let headerTopicsPanel = headerTopicsPanelForChatPresentationInterfaceState(self.chatPresentationInterfaceState, context: self.context, controllerInteraction: self.controllerInteraction, interfaceInteraction: self.interfaceInteraction, force: false) {
+             let panel = HeaderPanelContainerComponent.Panel(
+                 key: "topics",
+@@ -2770,8 +2781,17 @@ class ChatControllerNode: ASDisplayNode, ASScrollViewDelegate {
+             let headerPanelsFrame = CGRect(origin: CGPoint(x: layout.safeInsets.left, y: sidePanelTopInset), size: headerPanelsSize)
+             var headerPanelsTransition = ComponentTransition(transition)
+             if headerPanelsComponentView.superview == nil {
+-                headerPanelsTransition.animateAlpha(view: headerPanelsComponentView, from: 0.0, to: 1.0)
+-                headerPanelsTransition.animateScale(view: headerPanelsComponentView, from: 0.001, to: 1.0)
++                if self.ignoredMembersPanel?.introduces == true && !UIAccessibility.isReduceMotionEnabled {
++                    // The line of people ignored drops in from under the header, grows larger than itself for a couple of
++                    // seconds to be noticed, and settles.
++                    let layer = headerPanelsComponentView.layer
++                    layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.2)
++                    layer.animateSpring(from: NSValue(cgPoint: CGPoint(x: 0.0, y: -30.0)), to: NSValue(cgPoint: CGPoint()), keyPath: "position", duration: 0.7, damping: 72.0, additive: true)
++                    ignoreAddKeyframes(layer, keyPath: "transform.scale", values: [0.5, 1.09, 1.05, 1.07, 1.05, 1.0], keyTimes: [0.0, 0.14, 0.34, 0.56, 0.8, 1.0], duration: 2.3, delay: 0.0)
++                } else {
++                    headerPanelsTransition.animateAlpha(view: headerPanelsComponentView, from: 0.0, to: 1.0)
++                    headerPanelsTransition.animateScale(view: headerPanelsComponentView, from: 0.001, to: 1.0)
++                }
+                 headerPanelsTransition = headerPanelsTransition.withAnimation(.none)
+                 self.floatingTopicsPanelContainer.view.addSubview(headerPanelsComponentView)
+             }
+diff --git a/submodules/TelegramUI/Sources/ChatHistoryEntriesForView.swift b/submodules/TelegramUI/Sources/ChatHistoryEntriesForView.swift
+index b32f929d06..193f4bb97c 100644
+--- a/submodules/TelegramUI/Sources/ChatHistoryEntriesForView.swift
++++ b/submodules/TelegramUI/Sources/ChatHistoryEntriesForView.swift
+@@ -12,6 +12,7 @@ import TextFormat
+ import Markdown
+ import Display
+ import TelegramStringFormatting
++import IgnoredMembers
+ 
+ struct ChatHistoryEntriesForViewState {
+     private var messageStableIdToLocalId: [UInt32: Int64] = [:]
+@@ -33,6 +34,35 @@ struct ChatHistoryEntriesForViewState {
+     }
+ }
+ 
++/// Whether `message` is hidden because its author is ignored in groups (in groups and in comments, not in a channel's
++/// own posts).
++func chatHistoryHidesIgnored(message: Message, chatPeer: Peer?, location: ChatLocation, ignoredAuthorIds: Set<PeerId>) -> Bool {
++    guard message.id.peerId == location.peerId else {
++        return false
++    }
++    return IgnoredMembers.hides(message: message, chatChannel: chatPeer as? TelegramChannel, ignored: ignoredAuthorIds)
++}
++
++/// How many of the messages of `view` are hidden for each ignored author.
++func chatHistoryIgnoredAuthorCounts(view: MessageHistoryView, location: ChatLocation, ignoredAuthorIds: Set<PeerId>) -> [PeerId: Int] {
++    guard !ignoredAuthorIds.isEmpty else {
++        return [:]
++    }
++    var chatPeer: Peer?
++    for entry in view.additionalData {
++        if case let .peer(_, peer) = entry {
++            chatPeer = peer
++        }
++    }
++    var counts: [PeerId: Int] = [:]
++    for entry in view.entries {
++        if let authorId = entry.message.author?.id, chatHistoryHidesIgnored(message: entry.message, chatPeer: chatPeer, location: location, ignoredAuthorIds: ignoredAuthorIds) {
++            counts[authorId, default: 0] += 1
++        }
++    }
++    return counts
++}
++
+ func chatHistoryEntriesForView(
+     currentState: ChatHistoryEntriesForViewState,
+     context: AccountContext,
+@@ -52,6 +82,7 @@ func chatHistoryEntriesForView(
+     skipViewOnceMedia: Bool,
+     pendingUnpinnedAllMessages: Bool,
+     pendingRemovedMessages: Set<MessageId>,
++    ignoredAuthorIds: Set<PeerId> = Set(),
+     associatedData: ChatMessageItemAssociatedData,
+     updatingMedia: [MessageId: ChatUpdatingMessageMedia],
+     customChannelDiscussionReadState: MessageId?,
+@@ -153,6 +184,9 @@ func chatHistoryEntriesForView(
+         if pendingRemovedMessages.contains(message.id) {
+             continue
+         }
++        if !ignoredAuthorIds.isEmpty, chatHistoryHidesIgnored(message: message, chatPeer: chatPeer, location: location, ignoredAuthorIds: ignoredAuthorIds) {
++            continue
++        }
+         
+         if case let .replyThread(replyThreadMessage) = location, replyThreadMessage.isForumPost {
+             for media in message.media {
+@@ -472,7 +506,8 @@ func chatHistoryEntriesForView(
+         loop: for entry in view.additionalData {
+             switch entry {
+             case let .message(id, messages) where id == replyThreadMessage.effectiveTopId:
+-                if !messages.isEmpty {
++                // Not the message the thread answers either if its author is ignored in groups.
++                if !messages.isEmpty, !IgnoredMembers.hides(message: messages[0], ignored: ignoredAuthorIds) {
+                     let selection: ChatHistoryMessageSelection = .none
+                     
+                     let topMessage = messages[0]
+diff --git a/submodules/TelegramUI/Sources/ChatHistoryListNode.swift b/submodules/TelegramUI/Sources/ChatHistoryListNode.swift
+index 0fb1ee1031..925ee4394f 100644
+--- a/submodules/TelegramUI/Sources/ChatHistoryListNode.swift
++++ b/submodules/TelegramUI/Sources/ChatHistoryListNode.swift
+@@ -38,6 +38,7 @@ import TextFormat
+ import ChatNewThreadInfoItem
+ import PhoneNumberFormat
+ import Postbox
++import IgnoredMembers
+ 
+ struct ChatTopVisibleMessageRange: Equatable {
+     var lowerBound: MessageIndex
+@@ -47,6 +48,21 @@ struct ChatTopVisibleMessageRange: Equatable {
+ }
+ 
+ private let historyMessageCount: Int = 44
++/// The most messages loaded at once while the ones of people ignored in groups are skipped.
++private let maxIgnoredHistoryMessageCount: Int = 600
++
++/// The same place in the history with twice as many messages (while all loaded are of people ignored in groups).
++private func widenedIgnoredHistoryLocation(_ location: ChatHistoryLocation) -> ChatHistoryLocation? {
++    switch location {
++    case let .Initial(count):
++        return count >= maxIgnoredHistoryMessageCount ? nil : .Initial(count: min(count * 2, maxIgnoredHistoryMessageCount))
++    case let .Navigation(index, anchorIndex, count, highlight):
++        return count >= maxIgnoredHistoryMessageCount ? nil : .Navigation(index: index, anchorIndex: anchorIndex, count: min(count * 2, maxIgnoredHistoryMessageCount), highlight: highlight)
++    default:
++        return nil
++    }
++}
++
+ 
+ enum ChatHistoryViewScrollPosition {
+     case unread(index: MessageIndex)
+@@ -669,6 +685,8 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+     var scrolledToIndex: ((MessageHistoryScrollToSubject, Bool) -> Void)?
+     var scrolledToSomeIndex: (() -> Void)?
+     var beganDragging: (() -> Void)?
++    /// Called each time an update of the history has been applied: its item nodes are in place but not yet on screen.
++    var historyTransitionApplied: (() -> Void)?
+     
+     private let hasVisiblePlayableItemNodesPromise = ValuePromise<Bool>(false, ignoreRepeated: true)
+     var hasVisiblePlayableItemNodes: Signal<Bool, NoError> {
+@@ -712,6 +730,22 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+         }
+     }
+     
++    /// The loaded messages of `authorId` (for the messages coming back when someone is no longer ignored).
++    func loadedMessageIds(authorId: EnginePeer.Id) -> Set<MessageId> {
++        var result = Set<MessageId>()
++        for entry in self.historyView?.originalView.entries ?? [] where entry.message.author?.id == authorId {
++            result.insert(entry.message.id)
++        }
++        return result
++    }
++    
++    /// The people ignored in groups whose messages are hidden in this chat, and how many of the loaded messages are
++    /// theirs.
++    private let ignoredHiddenAuthorsPromise = ValuePromise<[EnginePeer.Id: Int]>([:], ignoreRepeated: true)
++    var ignoredHiddenAuthors: Signal<[EnginePeer.Id: Int], NoError> {
++        return self.ignoredHiddenAuthorsPromise.get()
++    }
++    
+     private let justSentTextMessagePromise = ValuePromise<Bool>(false)
+     var justSentTextMessage: Bool = false {
+         didSet {
+@@ -1962,6 +1996,14 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+             translationState = .single(nil)
+         }
+         
++        // The people ignored in groups (their messages are hidden in groups and in comments).
++        let ignoredAuthors: Signal<Set<EnginePeer.Id>, NoError>
++        if let peerId = chatLocation.peerId, peerId.namespace == Namespaces.Peer.CloudGroup || peerId.namespace == Namespaces.Peer.CloudChannel {
++            ignoredAuthors = IgnoredMembers.shared.signal(accountPeerId: context.account.peerId)
++        } else {
++            ignoredAuthors = .single(Set())
++        }
++        
+         let promises = combineLatest(
+             self.historyAppearsClearedPromise.get(),
+             self.pendingUnpinnedAllMessagesPromise.get(),
+@@ -1969,7 +2011,8 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+             self.currentlyPlayingMessageIdPromise.get(),
+             self.scrollToMessageIdPromise.get(),
+             self.chatHasBotsPromise.get(),
+-            self.allAdMessagesPromise.get()
++            self.allAdMessagesPromise.get(),
++            ignoredAuthors
+         )
+         
+         let contentSettings = self.context.engine.data.subscribe(TelegramEngine.EngineData.Item.Configuration.ContentSettings())
+@@ -2083,7 +2126,7 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+             contentSettings |> debug_measureTimeToFirstEvent(label: "chatHistoryNode_contentSettings")
+         ) |> debug_measureTimeToFirstEvent(label: "chatHistoryNode_firstChatHistoryTransition")).startStrict(next: { [weak self] update, chatPresentationData, selectedMessages, updatingMedia, networkType, preferredStoryHighQuality, animatedEmojiAndGiftStickers, additionalAnimatedEmojiStickers, customChannelDiscussionReadState, customThreadOutgoingReadState, availableReactions, availableMessageEffects, savedMessageTags, defaultReaction, accountPeer, accountCountry, suggestAudioTranscription, promises, topicAuthorId, translationState, maxReadStoryId, recommendedChannels, audioTranscriptionTrial, chatThemes, deviceContactsNumbers, contentSettings in
+             let (animatedEmojiStickers, premiumGiftStickers, tonGiftStickers) = animatedEmojiAndGiftStickers
+-            let (historyAppearsCleared, pendingUnpinnedAllMessages, pendingRemovedMessages, currentlyPlayingMessageIdAndType, scrollToMessageId, chatHasBots, allAdMessages) = promises
++            let (historyAppearsCleared, pendingUnpinnedAllMessages, pendingRemovedMessages, currentlyPlayingMessageIdAndType, scrollToMessageId, chatHasBots, allAdMessages, ignoredAuthors) = promises
+             
+             if measure_isFirstTime {
+                 measure_isFirstTime = false
+@@ -2368,6 +2411,9 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+                     pinToTopStableId = strongSelf.pinToTopStableId
+                 }
+                                 
++                // Whose messages are hidden here, for the line under the header.
++                self?.ignoredHiddenAuthorsPromise.set(chatHistoryIgnoredAuthorCounts(view: view, location: chatLocation, ignoredAuthorIds: ignoredAuthors))
++                
+                 let previousChatHistoryEntriesForViewState = chatHistoryEntriesForViewState.with({ $0 })
+                 let (filteredEntries, updatedChatHistoryEntriesForViewState) = chatHistoryEntriesForView(
+                     currentState: previousChatHistoryEntriesForViewState,
+@@ -2388,6 +2434,7 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+                     skipViewOnceMedia: mode != .bubbles,
+                     pendingUnpinnedAllMessages: pendingUnpinnedAllMessages,
+                     pendingRemovedMessages: pendingRemovedMessages,
++                    ignoredAuthorIds: ignoredAuthors,
+                     associatedData: associatedData,
+                     updatingMedia: updatingMedia,
+                     customChannelDiscussionReadState: customChannelDiscussionReadState,
+@@ -3118,6 +3165,79 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+         }
+     }
+     
++    /// Unseen mentions in hidden messages (of people ignored in groups) that lie between the messages on screen.
++    private func hiddenUnseenMentionIds(historyView: ChatHistoryView, visible: ListViewVisibleItemRange) -> [MessageId] {
++        guard let peerId = self.chatLocation.peerId, peerId.namespace == Namespaces.Peer.CloudGroup || peerId.namespace == Namespaces.Peer.CloudChannel else {
++            return []
++        }
++        let ignored = Set(IgnoredMembers.shared.list(accountPeerId: self.context.account.peerId))
++        let count = historyView.filteredEntries.count
++        guard !ignored.isEmpty, visible.firstIndex <= visible.lastIndex, visible.lastIndex < count else {
++            return []
++        }
++        // The list runs from the newest: the oldest entry on screen is the last of the visible range. The bounds are
++        // the shown entries just past those on screen (open where the screen reaches the end of what is shown), so that
++        // hidden mentions right before or after the screen count too.
++        let lowerIndex: MessageIndex? = visible.lastIndex + 1 < count ? historyView.filteredEntries[count - 1 - (visible.lastIndex + 1)].index : nil
++        let upperIndex: MessageIndex? = visible.firstIndex > 0 ? historyView.filteredEntries[count - 1 - (visible.firstIndex - 1)].index : nil
++        var chatPeer: Peer?
++        for entry in historyView.originalView.additionalData {
++            if case let .peer(_, peer) = entry {
++                chatPeer = peer
++            }
++        }
++        var result: [MessageId] = []
++        for entry in historyView.originalView.entries where (lowerIndex.flatMap { entry.index > $0 } ?? true) && (upperIndex.flatMap { entry.index < $0 } ?? true) {
++            let message = entry.message
++            guard message.tags.contains(.unseenPersonalMessage), chatHistoryHidesIgnored(message: message, chatPeer: chatPeer, location: self.chatLocation, ignoredAuthorIds: ignored) else {
++                continue
++            }
++            if message.attributes.contains(where: { ($0 as? ConsumablePersonalMentionMessageAttribute).flatMap({ !$0.pending }) ?? false }) {
++                result.append(message.id)
++            }
++        }
++        return result
++    }
++    
++    /// How many loaded messages are not shown past the first and the last shown ones, while people are ignored in groups
++    /// (else none: the history loads as it always does).
++    private func ignoredHiddenPastEdges(_ historyView: ChatHistoryView, firstIndex: MessageIndex, lastIndex: MessageIndex) -> (earlier: Int, later: Int) {
++        guard self.ignoredEdgeIndices(historyView) != nil else {
++            return (0, 0)
++        }
++        var earlier = 0
++        var later = 0
++        for entry in historyView.originalView.entries {
++            if entry.index < firstIndex {
++                earlier += 1
++            } else if entry.index > lastIndex {
++                later += 1
++            }
++        }
++        return (earlier, later)
++    }
++    
++    /// The first and last loaded messages, if either is hidden (its author is ignored in groups).
++    private func ignoredEdgeIndices(_ historyView: ChatHistoryView) -> (first: MessageIndex, last: MessageIndex)? {
++        guard let peerId = self.chatLocation.peerId, peerId.namespace == Namespaces.Peer.CloudGroup || peerId.namespace == Namespaces.Peer.CloudChannel, let first = historyView.originalView.entries.first, let last = historyView.originalView.entries.last else {
++            return nil
++        }
++        let ignored = Set(IgnoredMembers.shared.list(accountPeerId: self.context.account.peerId))
++        guard !ignored.isEmpty else {
++            return nil
++        }
++        var chatPeer: Peer?
++        for entry in historyView.originalView.additionalData {
++            if case let .peer(_, peer) = entry {
++                chatPeer = peer
++            }
++        }
++        if chatHistoryHidesIgnored(message: first.message, chatPeer: chatPeer, location: self.chatLocation, ignoredAuthorIds: ignored) || chatHistoryHidesIgnored(message: last.message, chatPeer: chatPeer, location: self.chatLocation, ignoredAuthorIds: ignored) {
++            return (first.index, last.index)
++        }
++        return nil
++    }
++    
+     private func processDisplayedItemRangeChanged(displayedRange: ListViewDisplayedItemRange, transactionState: ChatHistoryTransactionOpaqueState) {
+         let historyView = transactionState.historyView
+         var isTopReplyThreadMessageShownValue = false
+@@ -3548,6 +3668,9 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+             if !messageIdsWithRefreshStories.isEmpty {
+                 self.refreshStoriesProcessingManager.add(messageIdsWithRefreshStories.map { MessageAndThreadId(messageId: $0, threadId: nil) })
+             }
++            // Mentions in hidden messages (of people ignored in groups) between those on screen are taken as seen: they
++            // can never be shown, so their badge would never go.
++            messageIdsWithUnseenPersonalMention.append(contentsOf: self.hiddenUnseenMentionIds(historyView: historyView, visible: visible))
+             if !messageIdsWithUnseenPersonalMention.isEmpty {
+                 self.messageMentionProcessingManager.add(messageIdsWithUnseenPersonalMention.map { MessageAndThreadId(messageId: $0, threadId: nil) })
+             }
+@@ -3728,8 +3851,13 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+                 }
+             }
+             
++            // Messages hidden past the edges (of people ignored in groups) are loaded but not shown: as many more are
++            // loaded around the same message, so that the next ones shown are reached.
++            let hiddenPastEdges = self.ignoredHiddenPastEdges(historyView, firstIndex: firstEntry.index, lastIndex: lastEntry.index)
++            let laterCount = min(historyMessageCount + hiddenPastEdges.later * 2, maxIgnoredHistoryMessageCount)
++            let earlierCount = min(historyMessageCount + hiddenPastEdges.earlier * 2, maxIgnoredHistoryMessageCount)
+             if mathesFirst && historyView.originalView.laterId != nil {
+-                let locationInput: ChatHistoryLocation = .Navigation(index: .message(lastEntry.index), anchorIndex: .message(lastEntry.index), count: historyMessageCount, highlight: false)
++                let locationInput: ChatHistoryLocation = .Navigation(index: .message(lastEntry.index), anchorIndex: .message(lastEntry.index), count: laterCount, highlight: false)
+                 if self.chatHistoryLocationValue?.content != locationInput {
+                     self.chatHistoryLocationValue = ChatHistoryLocationInput(content: locationInput, id: self.takeNextHistoryLocationId())
+                 }
+@@ -3738,7 +3866,7 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+                     self.chatHistoryLocationValue = ChatHistoryLocationInput(content: .Navigation(index: .upperBound, anchorIndex: .upperBound, count: historyMessageCount, highlight: false), id: self.takeNextHistoryLocationId())
+                 }
+             } else if mathesLast {
+-                let locationInput: ChatHistoryLocation = .Navigation(index: .message(firstEntry.index), anchorIndex: .message(firstEntry.index), count: historyMessageCount, highlight: false)
++                let locationInput: ChatHistoryLocation = .Navigation(index: .message(firstEntry.index), anchorIndex: .message(firstEntry.index), count: earlierCount, highlight: false)
+                 if historyView.originalView.earlierId != nil {
+                     if self.chatHistoryLocationValue?.content != locationInput {
+                         self.chatHistoryLocationValue = ChatHistoryLocationInput(content: locationInput, id: self.takeNextHistoryLocationId())
+@@ -4419,6 +4547,8 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+         let completion: (Bool, ListViewDisplayedItemRange) -> Void = { [weak self] wasTransformed, visibleRange in
+             if let strongSelf = self {
+                 strongSelf.currentAppliedDeleteAnimationCorrelationIds.removeAll()
++                // The item nodes of the update are in place (and not yet on screen).
++                strongSelf.historyTransitionApplied?()
+                 
+                 var newIncomingReactions: [MessageId: (value: MessageReaction.Reaction, isLarge: Bool)] = [:]
+                 
+@@ -4508,6 +4638,13 @@ public final class ChatHistoryListNodeImpl: ASDisplayNode, ChatHistoryNode, Chat
+                     if historyView.filteredEntries.isEmpty {
+                         if historyView.originalView.isLoading {
+                             loadState = .loading(false)
++                        } else if strongSelf.ignoredEdgeIndices(historyView) != nil, historyView.originalView.earlierId != nil || historyView.originalView.laterId != nil, let widened = strongSelf.chatHistoryLocationValue.flatMap({ widenedIgnoredHistoryLocation($0.content) }) {
++                            // Everything loaded is of people ignored in groups: more is loaded around the same place, until
++                            // there is something to show.
++                            loadState = .loading(false)
++                            if strongSelf.chatHistoryLocationValue?.content != widened {
++                                strongSelf.chatHistoryLocationValue = ChatHistoryLocationInput(content: widened, id: strongSelf.takeNextHistoryLocationId())
++                            }
+                         } else if let firstEntry = historyView.originalView.entries.first {
+                             var emptyType = ChatHistoryNodeLoadState.EmptyType.generic
+                             for media in firstEntry.message.media {
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index 1ade8c01dc..45096074c7 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -39,6 +39,7 @@ import ChatMessageBubbleItemNode
+ import AdsInfoScreen
+ import AdsReportScreen
+ import WalletContext
++import IgnoredMembers
+  
+ private struct MessageContextMenuData {
+     let starStatus: Bool?
+@@ -1956,6 +1957,14 @@ func contextMenuForChatPresentationInterfaceState(chatPresentationInterfaceState
+             }
+         }
+         
++        // Ignore the author: their messages are hidden for the account in every group.
++        if let author = ignorableAuthor(chatPresentationInterfaceState: chatPresentationInterfaceState, context: context, messages: messages) {
++            let title = chatPresentationInterfaceState.strings.IgnoredMembers_Ignore(EnginePeer(author).compactDisplayTitle).string
++            actions.append(.custom(IgnoreMenuItem(kind: .ignore, title: title, action: {
++                (interfaceInteraction.chatController() as? ChatControllerImpl)?.ignoreAuthor(EnginePeer(author), sourceMessageId: message.id)
++            }), false))
++        }
++        
+         if data.messageActions.options.contains(.report) {
+             actions.append(.action(ContextMenuActionItem(text: chatPresentationInterfaceState.strings.Conversation_ContextMenuReport, icon: { theme in
+                 return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Report"), color: theme.actionSheet.primaryTextColor)
+@@ -4063,3 +4072,27 @@ private final class ChatRateTranscriptionContextItemNode: ASDisplayNode, Context
+         return self
+     }
+ }
++
++/// The author of `messages` if they can be ignored from here: someone else's messages (all of one person, not a bot)
++/// in a group or in the comments of a channel.
++private func ignorableAuthor(chatPresentationInterfaceState: ChatPresentationInterfaceState, context: AccountContext, messages: [EngineRawMessage]) -> TelegramUser? {
++    guard let first = messages.first, let author = first.author as? TelegramUser, author.id != context.account.peerId, author.botInfo == nil else {
++        return nil
++    }
++    guard messages.allSatisfy({ $0.author?.id == author.id && $0.effectivelyIncoming(context.account.peerId) && ($0.id.namespace == Namespaces.Message.Cloud || $0.id.namespace == Namespaces.Message.Local) }) else {
++        return nil
++    }
++    switch chatPresentationInterfaceState.subject {
++    case .none, .message:
++        break
++    default:
++        return nil
++    }
++    if case .customChatContents = chatPresentationInterfaceState.chatLocation {
++        return nil
++    }
++    guard IgnoredMembers.hides(message: first, ignored: Set([author.id])) else {
++        return nil
++    }
++    return author
++}
